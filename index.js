@@ -1,5 +1,3 @@
-'use strict';
-
 require('dotenv').config();
 const fetchOHLCV = require('./data/fetchOHLCV');
 const { calculateATR } = require('./indicators/atr');
@@ -7,9 +5,10 @@ const { calculateMACD } = require('./indicators/macd');
 const { checkBuySignal, checkSellSignal } = require('./strategy/signalCheck');
 const { executeOrder } = require('./trading/executeOrder');
 const config = require('./config/config');
-const binance = require('./utils/binanceClient');
-const WebSocket = require('ws');
-const { checkPositionStatus } = require('./trading/executeOrder');
+const binancePromise = require('./utils/binanceClient');
+
+// Флаг для запобігання повторної ініціалізації
+let isInitialized = false;
 
 // Обробники невідловлених помилок
 process.on('uncaughtException', (error) => {
@@ -20,25 +19,6 @@ process.on('uncaughtException', (error) => {
 
 process.on('unhandledRejection', (reason) => {
   console.error('Невідловлена відмова:', reason);
-});
-
-// Вебсокет для відстеження закриття позицій
-const ws = new WebSocket('wss://fstream.binance.com/ws/!forceOrder@arr');
-
-ws.on('message', (data) => {
-  try {
-    const event = JSON.parse(data);
-    if (event.o.x === 'FILLED') {
-      console.log('🔵 Ордер виконано:', event.o.s);
-      checkPositionStatus();
-    }
-  } catch (error) {
-    console.error('🔴 Помилка вебсокета:', error);
-  }
-});
-
-ws.on('error', (error) => {
-  console.error('🔴 Вебсокет помилка:', error.message);
 });
 
 let requestCount = 0;
@@ -65,16 +45,15 @@ process.on('SIGINT', () => {
 });
 
 // Функція для встановлення плеча з повторними спробами
-async function setLeverageWithRetry(symbol, leverage, maxRetries = 3) {
+async function setLeverageWithRetry(binance, symbol, leverage, maxRetries = 3) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       await binance.setLeverage(leverage, symbol);
-      console.log(`✅ Встановлено плече ${leverage}x для ${symbol}`);
       return true;
     } catch (error) {
       console.error(`🔴 Помилка встановлення плеча (спроба ${attempt}):`, error.message);
       if (attempt < maxRetries) {
-        await new Promise(resolve => setTimeout(resolve, 2000)); // Пауза 2 секунди
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
     }
   }
@@ -82,18 +61,43 @@ async function setLeverageWithRetry(symbol, leverage, maxRetries = 3) {
 }
 
 // Ініціалізація бота: встановлення маржі та плеча
-async function initializeBot() {
+async function initializeBot(binance) {
+  if (isInitialized) {
+    console.log('ℹ️ Бот вже ініціалізовано, пропускаємо...');
+    return true;
+  }
+
   try {
-    // Встановлення типу маржі
-    await binance.setMarginMode('ISOLATED', config.symbol);
-    console.log(`ℹ️ Тип маржі встановлено на ISOLATED для ${config.symbol}`);
+    console.log('🚀 Початок ініціалізації бота...');
+    
+    // Встановлення типу маржі з обробкою помилок
+    try {
+      await binance.setMarginType(config.symbol, 'ISOLATED');
+      console.log(`ℹ️ Тип маржі встановлено на ISOLATED для ${config.symbol}`);
+    } catch (marginError) {
+      console.warn('🟠 Попередження при встановленні типу маржі:', marginError.message);
+    }
     
     // Встановлення плеча з повторними спробами
-    await setLeverageWithRetry(config.symbol, config.leverage || 20);
+    await setLeverageWithRetry(binance, config.symbol, config.leverage || 20);
     
-    // Отримання балансу
-    const balance = await binance.fetchBalance();
-    console.log('💰 Initial balance:', balance.USDT);
+    // Отримання балансу з обробкою помилок
+    let usdtBalance = 0;
+    try {
+      const balance = await binance.fetchBalance();
+      usdtBalance = balance.total?.USDT || 
+                    balance.USDT?.total || 
+                    balance.total?.usdt || 
+                    balance.usdt?.total || 
+                    0;
+    } catch (balanceError) {
+      console.error('🔴 Помилка отримання балансу:', balanceError.message);
+    }
+    
+    console.log('💰 Початковий баланс:', usdtBalance);
+    
+    isInitialized = true;
+    console.log('✅ Ініціалізація завершена успішно');
     
     return true;
   } catch (error) {
@@ -102,7 +106,7 @@ async function initializeBot() {
   }
 }
 
-async function runBot() {
+async function runBot(binance) {
   try {
     await safeRequest(async () => {
       const serverTime = await binance.fetchTime();
@@ -138,7 +142,6 @@ async function runBot() {
       // Перевірка сигналів
       let buySignal = false, sellSignal = false;
       try {
-        // Додано перевірку наявності необхідних даних
         if (candles && atr && macd) {
           buySignal = checkBuySignal(candles, atr, macd);
           sellSignal = checkSellSignal(candles, atr, macd);
@@ -167,29 +170,32 @@ async function runBot() {
     });
   } catch (error) {
     console.error('❌ Помилка в циклі оновлення:', error.message);
-    console.error(error.stack); // Додатковий стек помилок для діагностики
+    console.error(error.stack);
   } finally {
-    setTimeout(runBot, config.updateInterval);
+    setTimeout(() => runBot(binance), config.updateInterval);
   }
 }
 
 async function handlePostOrderPause() {
   console.log('⏳ Пауза 10 секунд...');
   await new Promise(resolve => setTimeout(resolve, 10000));
-  requestCount += 2;  // Компенсація за додаткові запити
+  requestCount += 2;
 }
 
 // Головна функція запуску
 async function main() {
   try {
-    console.log('🟢 Telegram сповіщення увімкнено');
     console.log('🚀 Бот запущено');
     
-    // Ініціалізація бота
-    await initializeBot();
+    // Очікуємо ініціалізацію клієнта Binance
+    const binance = await binancePromise;
+    console.log('✅ Binance клієнт готовий до роботи');
+    
+    // Ініціалізація бота (тільки один раз)
+    await initializeBot(binance);
     
     // Запуск основного циклу
-    runBot();
+    runBot(binance);
   } catch (error) {
     console.error('🔴 Фатальна помилка при запуску бота:', error);
     process.exit(1);
