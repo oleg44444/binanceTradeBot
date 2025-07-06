@@ -3,14 +3,9 @@ const fetchOHLCV = require('./data/fetchOHLCV');
 const { calculateATR } = require('./indicators/atr');
 const { calculateMACD } = require('./indicators/macd');
 const { checkBuySignal, checkSellSignal } = require('./strategy/signalCheck');
-const { executeOrder } = require('./trading/executeOrder');
 const config = require('./config/config');
-const binancePromise = require('./utils/binanceClient');
+const binanceClientPromise = require('./utils/binanceClient');
 
-// Флаг для запобігання повторної ініціалізації
-let isInitialized = false;
-
-// Обробники невідловлених помилок
 process.on('uncaughtException', (error) => {
   console.error('Невідловлена помилка:', error.message);
   console.error(error.stack);
@@ -44,7 +39,6 @@ process.on('SIGINT', () => {
   process.exit();
 });
 
-// Функція для встановлення плеча з повторними спробами
 async function setLeverageWithRetry(binance, symbol, leverage, maxRetries = 3) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -60,17 +54,10 @@ async function setLeverageWithRetry(binance, symbol, leverage, maxRetries = 3) {
   throw new Error(`Не вдалося встановити плече після ${maxRetries} спроб`);
 }
 
-// Ініціалізація бота: встановлення маржі та плеча
 async function initializeBot(binance) {
-  if (isInitialized) {
-    console.log('ℹ️ Бот вже ініціалізовано, пропускаємо...');
-    return true;
-  }
-
   try {
     console.log('🚀 Початок ініціалізації бота...');
     
-    // Встановлення типу маржі з обробкою помилок
     try {
       await binance.setMarginType(config.symbol, 'ISOLATED');
       console.log(`ℹ️ Тип маржі встановлено на ISOLATED для ${config.symbol}`);
@@ -78,10 +65,8 @@ async function initializeBot(binance) {
       console.warn('🟠 Попередження при встановленні типу маржі:', marginError.message);
     }
     
-    // Встановлення плеча з повторними спробами
     await setLeverageWithRetry(binance, config.symbol, config.leverage || 20);
     
-    // Отримання балансу з обробкою помилок
     let usdtBalance = 0;
     try {
       const balance = await binance.fetchBalance();
@@ -95,10 +80,7 @@ async function initializeBot(binance) {
     }
     
     console.log('💰 Початковий баланс:', usdtBalance);
-    
-    isInitialized = true;
     console.log('✅ Ініціалізація завершена успішно');
-    
     return true;
   } catch (error) {
     console.error('🔴 Критична помилка ініціалізації:', error);
@@ -106,73 +88,177 @@ async function initializeBot(binance) {
   }
 }
 
-async function runBot(binance) {
+async function runBot(binance, trading) {
   try {
     await safeRequest(async () => {
-      const serverTime = await binance.fetchTime();
-      const serverDate = new Date(serverTime);
+      let serverDate;
+      try {
+        const serverTime = await binance.fetchTime();
+        serverDate = new Date(serverTime).toISOString();
+      } catch (timeError) {
+        console.error('⚠️ Using local time:', timeError.message);
+        serverDate = new Date().toISOString();
+      }
       
-      console.log('\n--- Оновлення даних ---');
-      console.log(`Запит №${requestCount}/${MAX_REQUESTS_PER_MINUTE}`);
-      console.log(`Час біржі (UTC): ${serverDate.toISOString()}`);
+      console.log('\n--- Data Update ---');
+      console.log(`Request #${requestCount}/${MAX_REQUESTS_PER_MINUTE}`);
+      console.log(`Exchange Time (UTC): ${serverDate}`);
 
-      // Отримання даних свічок
       let candles;
       try {
         candles = await fetchOHLCV(config.symbol, config.timeframe);
       } catch (err) {
-        throw new Error(`Помилка завантаження свічок: ${err.message}`);
+        throw new Error(`Candle loading error: ${err.message}`);
       }
 
-      // Сувора перевірка даних
-      if (!Array.isArray(candles) || candles.length === 0) {
-        throw new Error('Немає даних OHLCV');
+      if (!Array.isArray(candles) || candles.length < 50) {
+        throw new Error(`Insufficient OHLCV data (${candles?.length || 0} items)`);
       }
-      console.log(`✅ Отримано ${candles.length} свічок`);
 
-      // Розрахунок індикаторів з перевіркою вхідних даних
-      let atr, macd;
+      const currentPrice = Array.isArray(candles[candles.length - 1]) 
+        ? candles[candles.length - 1][4]
+        : candles[candles.length - 1].close;
+      
+      console.log(`📊 Current Price: ${currentPrice}`);
+
+      const atrPeriod = 14;
+      let currentATR = 0;
+      let atrValues = [];
+      
       try {
-        atr = calculateATR(candles, 14);
-        macd = calculateMACD(candles.map(c => c.close));
-      } catch (indicatorError) {
-        throw new Error(`Помилка індикаторів: ${indicatorError.message}`);
-      }
-
-      // Перевірка сигналів
-      let buySignal = false, sellSignal = false;
-      try {
-        if (candles && atr && macd) {
-          buySignal = checkBuySignal(candles, atr, macd);
-          sellSignal = checkSellSignal(candles, atr, macd);
+        atrValues = calculateATR(candles, atrPeriod);
+        if (Array.isArray(atrValues) && atrValues.length > 0) {
+          currentATR = atrValues[atrValues.length - 1] || 0;
+          console.log(`📈 ATR: ${currentATR?.toFixed(6)} (${atrValues.length} values)`);
         } else {
-          console.error('🚨 Недостатньо даних для перевірки сигналів');
+          console.warn('⚠️ ATR calculation returned empty array');
+          currentATR = 0;
+        }
+      } catch (atrError) {
+        console.error('⚠️ ATR calculation error:', atrError.message);
+        currentATR = 0;
+      }
+      
+      let macdData = null;
+      let currentMacd = 0;
+      let currentSignal = 0;
+      let currentHistogram = 0;
+      
+      try {
+        macdData = calculateMACD(candles);
+        
+        if (macdData && 
+            Array.isArray(macdData.macd) && 
+            Array.isArray(macdData.signal) && 
+            Array.isArray(macdData.histogram) &&
+            macdData.macd.length > 0 && 
+            macdData.signal.length > 0 &&
+            macdData.histogram.length > 0) {
+          
+          currentMacd = macdData.macd[macdData.macd.length - 1] || 0;
+          currentSignal = macdData.signal[macdData.signal.length - 1] || 0;
+          currentHistogram = macdData.histogram[macdData.histogram.length - 1] || 0;
+          
+          console.log(`📉 MACD: ${currentMacd?.toFixed(6)}`);
+          console.log(`📊 Signal: ${currentSignal?.toFixed(6)}`);
+          console.log(`📊 Histogram: ${currentHistogram?.toFixed(6)}`);
+        } else {
+          console.warn('⚠️ MACD data structure is invalid or empty');
+          macdData = {
+            macd: [0],
+            signal: [0],
+            histogram: [0]
+          };
+        }
+      } catch (macdError) {
+        console.error('⚠️ MACD calculation error:', macdError.message);
+        macdData = {
+          macd: [0],
+          signal: [0],
+          histogram: [0]
+        };
+      }
+      
+      let buySignal = false;
+      let sellSignal = false;
+      
+      try {
+        if (macdData && 
+            macdData.macd.length > 0 && 
+            macdData.signal.length > 0 &&
+            atrValues.length > 0 &&
+            currentPrice > 0) {
+          
+          buySignal = checkBuySignal(candles, atrValues, macdData);
+          sellSignal = checkSellSignal(candles, atrValues, macdData);
+          
+          console.log(`🔍 Buy Signal: ${buySignal ? '✅ YES' : '❌ NO'}`);
+          console.log(`🔍 Sell Signal: ${sellSignal ? '✅ YES' : '❌ NO'}`);
+        } else {
+          console.warn('⚠️ Insufficient data for signal checking');
+          console.log(`🔍 Buy Signal: ❌ NO (insufficient data)`);
+          console.log(`🔍 Sell Signal: ❌ NO (insufficient data)`);
         }
       } catch (signalError) {
-        console.error('🚨 Помилка перевірки сигналів:', signalError.message);
+        console.error('⚠️ Signal checking error:', signalError.message);
+        buySignal = false;
+        sellSignal = false;
+        console.log(`🔍 Buy Signal: ❌ NO (error)`);
+        console.log(`🔍 Sell Signal: ❌ NO (error)`);
       }
-
-      console.log('--- Сигнали ---');
-      console.log('Buy Signal:', buySignal);
-      console.log('Sell Signal:', sellSignal);
-
-      if (buySignal) {
-        console.log('🟢 Сигнал на КУПІВЛЮ');
-        await executeOrder('buy', config.symbol, config.tradeAmount);
-        await handlePostOrderPause();
-      } else if (sellSignal) {
-        console.log('🔴 Сигнал на ПРОДАЖ');
-        await executeOrder('sell', config.symbol, config.tradeAmount);
-        await handlePostOrderPause();
-      } else {
-        console.log('⏸️ Сигналів немає');
+      
+      if (buySignal && !sellSignal) {
+        console.log('🟢 Buy signal received!');
+        
+        try {
+          const balance = await trading.getAccountBalance();
+          const riskPercent = config.riskPercent || 2;
+          const leverage = config.leverage || 20;
+          const positionSize = (balance * riskPercent / 100) * leverage;
+          const quantity = positionSize / currentPrice;
+          
+          console.log(`💰 Position size: ${quantity.toFixed(6)} ${config.symbol}`);
+          console.log(`💰 Position value: ${positionSize.toFixed(2)} USDT`);
+          
+          await trading.executeOrder('buy', config.symbol, quantity);
+          await handlePostOrderPause();
+        } catch (orderError) {
+          console.error('🔴 Buy order execution error:', orderError.message);
+        }
+        
+      } else if (sellSignal && !buySignal) {
+        console.log('🔴 Sell signal received!');
+        
+        try {
+          const balance = await trading.getAccountBalance();
+          const riskPercent = config.riskPercent || 2;
+          const leverage = config.leverage || 20;
+          const positionSize = (balance * riskPercent / 100) * leverage;
+          const quantity = positionSize / currentPrice;
+          
+          console.log(`💰 Position size: ${quantity.toFixed(6)} ${config.symbol}`);
+          console.log(`💰 Position value: ${positionSize.toFixed(2)} USDT`);
+          
+          await trading.executeOrder('sell', config.symbol, quantity);
+          await handlePostOrderPause();
+        } catch (orderError) {
+          console.error('🔴 Sell order execution error:', orderError.message);
+        }
       }
+      
+      console.log(`📊 Data Summary:`);
+      console.log(`   Candles: ${candles.length}`);
+      console.log(`   ATR values: ${atrValues.length}`);
+      console.log(`   MACD values: ${macdData?.macd?.length || 0}`);
+      console.log(`   Current price: ${currentPrice}`);
+      console.log(`   Current ATR: ${currentATR?.toFixed(6)}`);
+      console.log(`   MACD trend: ${currentMacd > currentSignal ? '📈 Bullish' : '📉 Bearish'}`);
     });
   } catch (error) {
-    console.error('❌ Помилка в циклі оновлення:', error.message);
-    console.error(error.stack);
+    console.error('❌ Update cycle error:', error.message);
+    console.error('❌ Error stack:', error.stack);
   } finally {
-    setTimeout(() => runBot(binance), config.updateInterval);
+    setTimeout(() => runBot(binance, trading), config.updateInterval);
   }
 }
 
@@ -182,20 +268,22 @@ async function handlePostOrderPause() {
   requestCount += 2;
 }
 
-// Головна функція запуску
 async function main() {
   try {
     console.log('🚀 Бот запущено');
     
-    // Очікуємо ініціалізацію клієнта Binance
-    const binance = await binancePromise;
+    const binance = await binanceClientPromise(); 
     console.log('✅ Binance клієнт готовий до роботи');
     
-    // Ініціалізація бота (тільки один раз)
     await initializeBot(binance);
     
-    // Запуск основного циклу
-    runBot(binance);
+    const tradingModule = require('./trading/executeOrder');
+    
+    const trading = await tradingModule.initializeTradingModule();
+    
+    console.log('✅ Модуль торгівлі готовий до роботи');
+    
+    runBot(binance, trading);
   } catch (error) {
     console.error('🔴 Фатальна помилка при запуску бота:', error);
     process.exit(1);

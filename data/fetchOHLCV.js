@@ -1,33 +1,24 @@
-const binanceClient = require('../utils/binanceClient');
+const binanceClientPromise = require('../utils/binanceClient');
 
 async function fetchOHLCV(symbol, timeframe, limit = 100) {
+  const binance = await binanceClientPromise();
   try {
-    // Отримуємо екземпляр клієнта Binance
-    const binance = await binanceClient;
+    console.log(`📊 Завантаження ${limit} свічок ${timeframe} для ${symbol}...`);
     
-    // Використовуємо правильний метод API
-    const candles = await binance.fetchOHLCV(
-      symbol, 
-      timeframe, 
-      undefined, 
-      limit,
-      {
-        price: 'mark'
-      }
-    );
+    // Розрахунок часу для останніх свічок
+    const since = Date.now() - (1000 * 60 * 60 * 24 * 7); // 1 тиждень назад
     
-    // Перетворюємо дані у зручний формат
-    return candles.map(candle => ({
-      timestamp: candle[0],
-      open: candle[1],
-      high: candle[2],
-      low: candle[3],
-      close: candle[4],
-      volume: candle[5],
-      closeTime: candle[6]
-    }));
+    // Безпечне отримання даних
+    const candles = await binance.fetchOHLCV(symbol, timeframe, since, limit);
+    
+    if (!candles || candles.length === 0) {
+      throw new Error('Не отримано даних свічок');
+    }
+    
+    console.log(`✅ Отримано ${candles.length} свічок`);
+    return candles;
   } catch (error) {
-    console.error(`🔴 Помилка отримання свічок для ${symbol}:`, error.message);
+    console.error(`🔴 Помилка завантаження свічок: ${error.message}`);
     throw error;
   }
 }

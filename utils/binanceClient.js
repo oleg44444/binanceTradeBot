@@ -6,47 +6,49 @@ const telegram = require('./telegramNotifier');
 let isClientInitialized = false;
 let initializationPromise = null;
 
-class CustomBinance extends ccxt.binance {
-  constructor(...args) {
-    super(...args);
-    this.trailingStopUpdateInProgress = false;
-    this.listenKey = null;
-    this.ws = null;
-    this.listenKeyInterval = null;
-    this.wsReconnectTimeout = null;
+// Валідація конфігурації
+function validateConfig() {
+  if (!config.binance) {
+    throw new Error('❌ Конфігурація Binance відсутня');
   }
 
-  async createOrder(symbol, type, side, amount, price, params = {}) {
-    try {
-      if (params.newClientOrderId && params.newClientOrderId.length > 32) {
-        params.newClientOrderId = params.newClientOrderId.substring(0, 32);
-      }
+  const apiKey = config.binance.apiKey;
+  const apiSecret = config.binance.apiSecret;
 
-      const conditionalTypes = ['stop', 'stop_market', 'take_profit', 'take_profit_market'];
-      if (conditionalTypes.includes(type) && !params.hasOwnProperty('reduceOnly')) {
-        params.reduceOnly = true;
-      }
-
-      if (type === 'limit' && !params.timeInForce) {
-        params.timeInForce = 'GTC';
-      }
-
-      return await super.createOrder(symbol, type, side, amount, price, params);
-    } catch (error) {
-      console.error('🔴 Order creation error:', error.message);
-      if (error.message.includes('reduce only')) {
-        console.log('🔄 Retrying without reduceOnly');
-        const newParams = { ...params };
-        delete newParams.reduceOnly;
-        return await super.createOrder(symbol, type, side, amount, price, newParams);
-      }
-      throw error;
-    }
+  if (!apiKey || !apiSecret) {
+    throw new Error('❌ API ключі відсутні у конфігурації');
   }
 
-  async setLeverage(leverage, symbol) {
+  if (typeof apiKey !== 'string' || typeof apiSecret !== 'string') {
+    throw new Error('❌ API ключі мають бути рядками');
+  }
+
+  if (apiKey.trim().length === 0 || apiSecret.trim().length === 0) {
+    throw new Error('❌ API ключі не можуть бути порожніми');
+  }
+
+  return { apiKey: apiKey.trim(), apiSecret: apiSecret.trim() };
+}
+
+// Функція для створення клієнта Binance з правильним контекстом
+function createBinanceClient(apiKey, apiSecret) {
+  const client = new ccxt.binance({
+    apiKey,
+    secret: apiSecret,
+    options: {
+      defaultType: 'future',
+      testnet: config.binance.testnet || false,
+      adjustForTimeDifference: true
+    },
+    enableRateLimit: true,
+    timeout: 30000,
+    rateLimit: 150
+  });
+
+  // Додаємо додаткові методи з правильним контекстом
+  client.setLeverage = async (leverage, symbol) => {
     try {
-      await this.fapiPrivatePostLeverage({
+      await client.fapiPrivatePostLeverage({
         symbol: symbol.replace('/', ''),
         leverage: leverage
       });
@@ -56,11 +58,11 @@ class CustomBinance extends ccxt.binance {
         throw error;
       }
     }
-  }
+  };
 
-  async setMarginType(symbol, marginType = 'ISOLATED') {
+  client.setMarginType = async (symbol, marginType = 'ISOLATED') => {
     try {
-      await this.fapiPrivatePostMarginType({
+      await client.fapiPrivatePostMarginType({
         symbol: symbol.replace('/', ''),
         marginType: marginType
       });
@@ -73,12 +75,12 @@ class CustomBinance extends ccxt.binance {
         throw error;
       }
     }
-  }
+  };
 
-  async fetchPosition(symbol) {
+  client.fetchPosition = async (symbol) => {
     try {
       const cleanSymbol = symbol.replace('/', '');
-      const positions = await this.fetchPositions([cleanSymbol]);
+      const positions = await client.fetchPositions([cleanSymbol]);
       const position = positions.find(p => 
         p.symbol === cleanSymbol && 
         Math.abs(p.contracts) > 0.001
@@ -94,63 +96,27 @@ class CustomBinance extends ccxt.binance {
       console.error('🔴 Position fetch error:', error.message);
       throw error;
     }
-  }
+  };
 
-  async destroy() {
+  client.destroy = async () => {
     try {
-      if (this.listenKeyInterval) {
-        clearInterval(this.listenKeyInterval);
-        this.listenKeyInterval = null;
-      }
-
-      if (this.wsReconnectTimeout) {
-        clearTimeout(this.wsReconnectTimeout);
-        this.wsReconnectTimeout = null;
-      }
-
-      if (this.ws) {
-        this.ws.removeAllListeners();
-        this.ws.close();
-        this.ws = null;
-      }
-
-      if (this.listenKey) {
-        await this.fapiPrivateDeleteListenKey({ listenKey: this.listenKey });
-        console.log('🗑️ ListenKey видалено');
-        this.listenKey = null;
-      }
-
-      console.log('✅ CustomBinance знищено');
+      console.log('✅ Binance client destroyed');
     } catch (err) {
       console.error('🔴 Помилка при знищенні ресурсу:', err.message);
     }
-  }
+  };
+
+  return client;
 }
-
-const apiKey = config.binance?.apiKey;
-const apiSecret = config.binance?.apiSecret;
-
-if (!apiKey || !apiSecret) {
-  throw new Error('❌ API ключі відсутні у конфігурації');
-}
-
-const binance = new CustomBinance({
-  apiKey: apiKey.trim(),
-  secret: apiSecret.trim(),
-  options: {
-    defaultType: 'future',
-    testnet: config.binance.testnet || false,
-    adjustForTimeDifference: true
-  },
-  enableRateLimit: true,
-  timeout: 30000,
-  rateLimit: 150
-});
 
 // Обробка завершення процесу
 process.on('SIGINT', async () => {
   console.log('🛑 Завершення роботи...');
-  await binance.destroy();
+  process.exit();
+});
+
+process.on('SIGTERM', async () => {
+  console.log('🛑 Отримано сигнал SIGTERM, завершення роботи...');
   process.exit();
 });
 
@@ -158,71 +124,165 @@ process.on('SIGINT', async () => {
 async function initializeBinanceClient() {
   if (isClientInitialized) {
     console.log('ℹ️ Binance клієнт вже ініціалізовано');
-    return binance;
+    return binanceInstance;
   }
 
-  try {
-    // Завантаження ринків
-    await binance.loadMarkets();
-    
-    const time = await binance.fetchTime();
-    console.log('🟢 Успішне підключення до Binance. Час сервера:', new Date(time).toISOString());
+  if (initializationPromise) {
+    return initializationPromise;
+  }
 
-    const cleanSymbol = config.symbol.replace('/', '');
+  initializationPromise = (async () => {
+    try {
+      console.log('🔄 Початок ініціалізації Binance клієнта...');
+      
+      const { apiKey, apiSecret } = validateConfig();
 
-    // Налаштування акаунту
-    await binance.setMarginType(config.symbol, 'ISOLATED');
-    await binance.setLeverage(config.leverage, config.symbol);
+      // Створюємо клієнт Binance
+      const binanceInstance = createBinanceClient(apiKey, apiSecret);
 
-    // Перевірка балансу - ВИПРАВЛЕННЯ
-    const balance = await binance.fetchBalance();
-    const usdtBalance = balance.total?.USDT || 
+      // Завантаження ринків
+      console.log('📥 Завантаження ринків...');
+      await binanceInstance.loadMarkets();
+      console.log('✅ Ринки завантажено');
+
+      // Отримання часу сервера
+      console.log('🕐 Отримання часу сервера...');
+      const time = await binanceInstance.fetchTime();
+      
+      let serverDateString;
+      try {
+        if (typeof time === 'number' && !isNaN(time)) {
+          serverDateString = new Date(time).toISOString();
+        } else {
+          serverDateString = 'невідомий (невалідний час)';
+        }
+      } catch (dateError) {
+        console.warn('🟡 Помилка форматування дати:', dateError.message);
+        serverDateString = 'невідомий (помилка форматування)';
+      }
+      
+      console.log('🟢 Успішне підключення до Binance. Час сервера:', serverDateString);
+
+      // Перевірка символу
+      if (!config.symbol) {
+        throw new Error('❌ Символ торгівлі не вказано в конфігурації');
+      }
+
+      const cleanSymbol = config.symbol.replace('/', '');
+      console.log(`📊 Використовується символ: ${config.symbol} (${cleanSymbol})`);
+
+      // Налаштування акаунту
+      try {
+        console.log('⚙️ Налаштування типу маржі...');
+        await binanceInstance.setMarginType(config.symbol, 'ISOLATED');
+      } catch (marginError) {
+        console.warn('🟡 Попередження при налаштуванні маржі:', marginError.message);
+      }
+
+      try {
+        console.log('⚙️ Налаштування плеча...');
+        await binanceInstance.setLeverage(config.leverage || 20, config.symbol);
+        console.log(`✅ Плече встановлено: ${config.leverage || 20}x`);
+      } catch (leverageError) {
+        console.warn('🟡 Попередження при налаштуванні плеча:', leverageError.message);
+      }
+
+      // Отримання балансу
+      console.log('💰 Отримання балансу...');
+      let usdtBalance = 0;
+      let balanceInfo = 'невідомий';
+      
+      try {
+        const balance = await binanceInstance.fetchBalance();
+        
+        if (balance && typeof balance === 'object') {
+          usdtBalance = balance.total?.USDT || 
                        balance.USDT?.total || 
                        balance.total?.usdt || 
                        balance.usdt?.total || 
+                       balance.free?.USDT ||
+                       balance.USDT?.free ||
                        0;
-    
-    // Перевірка маржі
-    const positions = await binance.fetchPositions([cleanSymbol]);
-    const position = positions.find(p => p.symbol === cleanSymbol);
-    const usedMargin = position ? Math.abs(position.notional) / config.leverage : 0;
-    
-    console.log('💰 Баланс:', {
-      total: usdtBalance,
-      available: usdtBalance - usedMargin,
-      usedMargin: usedMargin
-    });
+          
+          balanceInfo = `${usdtBalance.toFixed(2)} USDT`;
+          console.log('✅ Баланс отримано:', balanceInfo);
+        } else {
+          console.warn('🟡 Неочікувана структура балансу');
+        }
+      } catch (balanceError) {
+        console.error('🔴 Помилка отримання балансу:', balanceError.message);
+        balanceInfo = 'помилка отримання';
+      }
+      
+      // Перевірка позицій
+      let usedMargin = 0;
+      try {
+        console.log('📊 Перевірка позицій...');
+        const positions = await binanceInstance.fetchPositions([cleanSymbol]);
+        const position = positions.find(p => p.symbol === cleanSymbol);
+        usedMargin = position ? Math.abs(position.notional) / (config.leverage || 20) : 0;
+        console.log(`✅ Використано маржі: ${usedMargin.toFixed(2)} USDT`);
+      } catch (positionError) {
+        console.warn('🟡 Помилка перевірки позицій:', positionError.message);
+      }
 
-    if (telegram.enabled) {
-      await telegram.sendMessage(
-        `🚀 Бот успішно запущено!\n` +
-        `- Символ: ${config.symbol}\n` +
-        `- Баланс: ${usdtBalance.toFixed(2)} USDT\n` +
-        `- Плече: ${config.leverage}x\n` +
-        `- Використано маржі: ${usedMargin.toFixed(2)} USDT`
-      );
+      console.log('💰 Підсумок балансу:', {
+        total: `${usdtBalance.toFixed(2)} USDT`,
+        available: `${(usdtBalance - usedMargin).toFixed(2)} USDT`,
+        usedMargin: `${usedMargin.toFixed(2)} USDT`
+      });
+
+      // Відправка повідомлення в Telegram
+      if (telegram && telegram.enabled) {
+        try {
+          await telegram.sendMessage(
+            `🚀 Бот успішно запущено!\n` +
+            `- Символ: ${config.symbol}\n` +
+            `- Баланс: ${balanceInfo}\n` +
+            `- Плече: ${config.leverage || 20}x\n` +
+            `- Використано маржі: ${usedMargin.toFixed(2)} USDT\n` +
+            `- Час сервера: ${serverDateString}`
+          );
+        } catch (telegramError) {
+          console.warn('🟡 Помилка відправки в Telegram:', telegramError.message);
+        }
+      }
+
+      // Попередження про низький баланс
+      if (usdtBalance > 0 && usdtBalance < 100) {
+        console.warn('⚠️ Увага: баланс менше 100 USDT. Рекомендується поповнити рахунок.');
+      }
+
+      isClientInitialized = true;
+      console.log('✅ Binance клієнт ініціалізовано успішно');
+      return binanceInstance;
+
+    } catch (error) {
+      console.error('🔴 Критична помилка ініціалізації:', error.message);
+      console.error('🔍 Стек помилки:', error.stack);
+      
+      if (telegram && telegram.enabled) {
+        try {
+          await telegram.sendError('initialization', error);
+        } catch (telegramError) {
+          console.error('🔴 Помилка відправки помилки в Telegram:', telegramError.message);
+        }
+      }
+      
+      isClientInitialized = false;
+      initializationPromise = null;
+      
+      throw error;
     }
+  })();
 
-    if (usdtBalance < 100) {
-      console.warn('⚠️ Увага: баланс менше 100 USDT. Рекомендується поповнити рахунок.');
-    }
-
-    isClientInitialized = true;
-    console.log('✅ Binance клієнт ініціалізовано успішно');
-    return binance;
-
-  } catch (error) {
-    console.error('🔴 Критична помилка ініціалізації:', error);
-    if (telegram.enabled) {
-      await telegram.sendError('initialization', error);
-    }
-    throw error;
-  }
+  return initializationPromise;
 }
-// Експортуємо проміс ініціалізації
-module.exports = (() => {
+
+// Експортуємо функцію, яка повертає проміс ініціалізації клієнта
+module.exports = function getBinanceClient() {
   if (!initializationPromise) {
     initializationPromise = initializeBinanceClient();
   }
   return initializationPromise;
-})();
+};

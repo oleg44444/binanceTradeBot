@@ -3,7 +3,7 @@ require('dotenv').config();
 module.exports = {
     symbol: 'SOL/USDT',
     timeframe: '5m',
-    tradeAmount: 1,
+    tradeAmount: 5,
     leverage: 20,
     updateInterval: 30000,
     maxRequestsPerMinute: 50,
