@@ -2,8 +2,8 @@ require('dotenv').config();
 
 module.exports = {
     symbol: 'SOL/USDT',
-    timeframe: '5m',
-    tradeAmount: 5,
+    timeframe: '15m',
+    tradeAmount: 3,
     leverage: 20,
     updateInterval: 30000,
     maxRequestsPerMinute: 50,
@@ -16,4 +16,5 @@ module.exports = {
         token: process.env.TELEGRAM_BOT_TOKEN,
         chatId: process.env.TELEGRAM_CHAT_ID 
     }
+  
 };
