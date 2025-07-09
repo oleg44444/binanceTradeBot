@@ -1,8 +1,8 @@
 require('dotenv').config();
 const fetchOHLCV = require('./data/fetchOHLCV');
-const { calculateATR } = require('./indicators/atr');
-const { calculateMACD } = require('./indicators/macd');
-const { checkBuySignal, checkSellSignal } = require('./strategy/signalCheck');
+const { calculateATR } = require('./indicators/ema');
+const { calculateMACD } = require('./indicators/rsi');
+const { checkBuySignal, checkSellSignal } = require('./signals/checkBuySell');
 const config = require('./config/config');
 const binanceClientPromise = require('./utils/binanceClient');
 const { initializeTradingModule } = require('./trading/executeOrder');
