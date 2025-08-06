@@ -1,5 +1,8 @@
 function calculateRSI(closes, period = 14) {
-  const rsi = [];
+  const rsi = Array(closes.length).fill(null);
+
+  if (closes.length <= period) return rsi;
+
   let gainSum = 0;
   let lossSum = 0;
 
@@ -12,9 +15,7 @@ function calculateRSI(closes, period = 14) {
   let avgGain = gainSum / period;
   let avgLoss = lossSum / period;
 
-  if (avgLoss === 0) return closes.map(() => 100);
-
-  rsi[period] = 100 - 100 / (1 + avgGain / avgLoss);
+  rsi[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
 
   for (let i = period + 1; i < closes.length; i++) {
     const change = closes[i] - closes[i - 1];
@@ -24,7 +25,7 @@ function calculateRSI(closes, period = 14) {
     avgGain = (avgGain * (period - 1) + gain) / period;
     avgLoss = (avgLoss * (period - 1) + loss) / period;
 
-    rsi[i] = 100 - 100 / (1 + avgGain / avgLoss);
+    rsi[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
   }
 
   return rsi;

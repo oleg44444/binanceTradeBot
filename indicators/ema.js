@@ -1,6 +1,9 @@
 function calculateEMA(prices, period) {
   const k = 2 / (period + 1);
-  let emaArray = [];
+  const emaArray = Array(prices.length).fill(null);
+
+  if (prices.length < period) return emaArray;
+
   let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
   emaArray[period - 1] = ema;
 

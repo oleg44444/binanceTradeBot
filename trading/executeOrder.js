@@ -1,4 +1,5 @@
 const config = require('../config/config');
+const { DCA_CONFIG } = config;
 const { v4: uuidv4 } = require('uuid');
 const telegram = require('../utils/telegramNotifier');
 const WebSocket = require('ws');
@@ -18,10 +19,12 @@ let activePosition = {
   type: null,
   totalAmount: 0,
   entryPrice: 0,
+  lastAveragePrice: 0,
   breakEvenReached: false,
   trailingActivated: false,
   trailingInterval: null,
-  lastTrailingUpdate: 0
+  lastTrailingUpdate: 0,
+  dcaCount: 0
 };
 
 function validateActivePosition() {
@@ -221,40 +224,40 @@ function calculateCurrentProfit(currentPrice) {
 
   return Math.max(0, effectiveProfit);
 }
-
 async function cancelPositionOrders() {
-  if (!activePosition.id) return;
+  if (!binance || !config.symbol) return;
+
   try {
-    await safeExchangeCall(() => binance.cancelAllOrders(config.symbol));
-    console.log('🗑️ Всі ордери скасовані');
-    telegram.sendMessage(`Скасовано ордери для ${config.symbol}`);
+    const openOrders = await safeExchangeCall(() =>
+      binance.fetchOpenOrders(config.symbol)
+    );
+
+    if (!openOrders || openOrders.length === 0) {
+      console.log('ℹ️ Немає відкритих ордерів для скасування');
+      return;
+    }
+
+    console.log(`🔁 Скасовуємо ${openOrders.length} відкритих ордерів...`);
+
+    for (const order of openOrders) {
+      try {
+        await safeExchangeCall(() =>
+          binance.cancelOrder(order.id, config.symbol)
+        );
+        console.log(`✅ Ордер скасовано: ID=${order.id}, тип=${order.type}`);
+      } catch (err) {
+        console.warn(`⚠️ Не вдалося скасувати ордер ${order.id}: ${err.message}`);
+      }
+    }
+
+    telegram.sendMessage(`🗑️ Скасовано ${openOrders.length} відкритих ордерів для ${config.symbol}`);
+
   } catch (error) {
-    console.error('🔴 Помилка скасування:', error.message);
+    console.error('🔴 Помилка скасування ордерів:', error.message);
     telegram.sendError('cancel_orders', error);
   }
 }
 
-function clearActivePosition() {
-  if (activePosition.trailingInterval) {
-    clearInterval(activePosition.trailingInterval);
-    activePosition.trailingInterval = null;
-  }
-
-  binance.cancelAllOrders(config.symbol).catch(() => { });
-
-  activePosition = {
-    id: null,
-    type: null,
-    totalAmount: 0,
-    entryPrice: 0,
-    breakEvenReached: false,
-    trailingActivated: false,
-    trailingInterval: null,
-    lastTrailingUpdate: 0
-  };
-
-  console.log('🧹 Активну позицію очищено');
-}
 
 async function syncPositionWithExchange() {
   if (!binance) {
@@ -280,18 +283,32 @@ async function syncPositionWithExchange() {
     const hasPosition = position && Math.abs(Number(position.contracts)) > 0.001;
 
     if (!hasPosition && activePosition.id) {
-      console.log('🔄 Позиція закрита на біржі. Очищаємо стан...');
+      console.log('🔄 Позиція відсутня на біржі. Очищаємо локальний стан та скасовуємо ордери...');
+
+      // 🛑 Скасовуємо відкриті ордери
+      await cancelPositionOrders();
+
+      // 🧹 Очистити активну позицію
       clearActivePosition();
+
+      telegram.sendMessage(`🟡 Позиція ${config.symbol} вже закрита, ордери скасовано`);
+
       return false;
     }
 
     if (hasPosition) {
+      const newType = position.side && position.side.toLowerCase() === 'long' ? 'buy' : 'sell';
+      const newAmount = Math.abs(Number(position.contracts));
+      const newEntryPrice = Number(position.entryPrice || position.markPrice);
+
       if (!activePosition.id) {
         console.log('🔄 Виявлено активну позицію на біржі. Синхронізація...');
+
         activePosition.id = generatePositionId();
-        activePosition.type = position.side && position.side.toLowerCase() === 'long' ? 'buy' : 'sell';
-        activePosition.totalAmount = Math.abs(Number(position.contracts));
-        activePosition.entryPrice = Number(position.entryPrice || position.markPrice);
+        activePosition.type = newType;
+        activePosition.totalAmount = newAmount;
+        activePosition.entryPrice = newEntryPrice;
+        activePosition.lastAveragePrice = newEntryPrice;
 
         if (activePosition.trailingInterval) clearInterval(activePosition.trailingInterval);
         activePosition.trailingInterval = setInterval(async () => {
@@ -301,15 +318,20 @@ async function syncPositionWithExchange() {
           await checkAndAutoClosePositionIfNeeded();
         }, POSITION_CHECK_INTERVAL);
 
-        console.log('🔄 Синхронізовано активну позицію з біржі:', {
+        console.log('✅ Активну позицію синхронізовано:', {
           side: activePosition.type,
           amount: activePosition.totalAmount,
           entry: activePosition.entryPrice
         });
+
         await updateSafetyOrders();
       } else {
-        activePosition.totalAmount = Math.abs(Number(position.contracts));
-        activePosition.entryPrice = Number(position.entryPrice || position.markPrice);
+        activePosition.totalAmount = newAmount;
+        activePosition.entryPrice = newEntryPrice;
+
+        if (!activePosition.lastAveragePrice || activePosition.lastAveragePrice === 0) {
+          activePosition.lastAveragePrice = newEntryPrice;
+        }
       }
     }
 
@@ -321,71 +343,101 @@ async function syncPositionWithExchange() {
   }
 }
 
+
+
+function clearActivePosition() {
+  if (activePosition.trailingInterval) {
+    clearInterval(activePosition.trailingInterval);
+    activePosition.trailingInterval = null;
+  }
+
+  binance.cancelAllOrders(config.symbol).catch(() => { });
+
+  activePosition = {
+    id: null,
+    type: null,
+    totalAmount: 0,
+    entryPrice: 0,
+    dcaCount: 0,
+    lastAveragePrice: 0,
+    breakEvenReached: false,
+    trailingActivated: false,
+    trailingInterval: null,
+    lastTrailingUpdate: 0
+  };
+
+  console.log('🧹 Активну позицію очищено');
+}
+
+
+
 async function updateSafetyOrders() {
   if (!validateActivePosition()) return;
 
   try {
+    // ❌ Скасовуємо попередні TP/SL
     await cancelPositionOrders();
 
     const params = getCurrentRiskParams();
+    const ticker = await safeExchangeCall(() => binance.fetchTicker(config.symbol));
+    const currentPrice = ticker.last;
+    const isBuy = activePosition.type === 'buy';
+    const amount = activePosition.totalAmount;
 
-    const currentTicker = await safeExchangeCall(() => binance.fetchTicker(config.symbol));
-    const currentPrice = currentTicker.last;
-
-    const MIN_STOP_DISTANCE_PERCENT = 0.1;
-
+    // 🧠 Функція безпечного коригування
     function adjustStopPrice(stopPrice, currentPrice, isBuy) {
+      const minDist = currentPrice * (MIN_STOP_DISTANCE_PERCENT / 100);
       if (isBuy) {
-        const minAllowed = currentPrice * (1 - MIN_STOP_DISTANCE_PERCENT / 100);
-        if (stopPrice >= currentPrice) return minAllowed;
+        return Math.min(stopPrice, currentPrice - minDist);
       } else {
-        const maxAllowed = currentPrice * (1 + MIN_STOP_DISTANCE_PERCENT / 100);
-        if (stopPrice <= currentPrice) return maxAllowed;
+        return Math.max(stopPrice, currentPrice + minDist);
       }
-      return stopPrice;
     }
 
-    const slRaw = activePosition.type === 'buy'
+    const slRaw = isBuy
       ? activePosition.entryPrice * (1 - params.STOP_LOSS / 100)
       : activePosition.entryPrice * (1 + params.STOP_LOSS / 100);
 
-    const tpRaw = activePosition.type === 'buy'
+    const tpRaw = isBuy
       ? activePosition.entryPrice * (1 + params.TAKE_PROFIT / 100)
       : activePosition.entryPrice * (1 - params.TAKE_PROFIT / 100);
 
-    const slPrice = adjustStopPrice(slRaw, currentPrice, activePosition.type === 'buy');
-    const tpPrice = adjustStopPrice(tpRaw, currentPrice, activePosition.type !== 'buy');
+    const slPrice = adjustStopPrice(slRaw, currentPrice, isBuy);
+    const tpPrice = adjustStopPrice(tpRaw, currentPrice, !isBuy);
 
-    const amount = activePosition.totalAmount;
+    console.log(`🛡️ Створюємо ордери безпеки: TP=${tpPrice.toFixed(4)} SL=${slPrice.toFixed(4)}`);
 
-    console.log(`🛡️ Створення ордерів безпеки: TP: ${tpPrice.toFixed(4)}, SL: ${slPrice.toFixed(4)}`);
+    const tpOrder = await safeExchangeCall(() =>
+      binance.createOrder(
+        config.symbol,
+        'TAKE_PROFIT_MARKET',
+        isBuy ? 'sell' : 'buy',
+        amount,
+        null,
+        { stopPrice: tpPrice }
+      )
+    );
 
-    const tpOrder = await safeExchangeCall(() => binance.createOrder(
-      config.symbol,
-      'TAKE_PROFIT_MARKET',
-      activePosition.type === 'buy' ? 'sell' : 'buy',
-      amount,
-      null,
-      { stopPrice: tpPrice }
-    ));
+    const slOrder = await safeExchangeCall(() =>
+      binance.createOrder(
+        config.symbol,
+        'STOP_MARKET',
+        isBuy ? 'sell' : 'buy',
+        amount,
+        null,
+        { stopPrice: slPrice }
+      )
+    );
 
-    const slOrder = await safeExchangeCall(() => binance.createOrder(
-      config.symbol,
-      'STOP_MARKET',
-      activePosition.type === 'buy' ? 'sell' : 'buy',
-      amount,
-      null,
-      { stopPrice: slPrice }
-    ));
-
-    console.log('✅ Ордери безпеки створено');
-    telegram.sendMessage(`Ордери безпеки створено: TP ${tpPrice.toFixed(4)}, SL ${slPrice.toFixed(4)}`);
+    console.log('✅ TP/SL ордери оновлено');
+    telegram.sendMessage(`📍 TP/SL оновлено: TP=${tpPrice.toFixed(4)}, SL=${slPrice.toFixed(4)}`);
 
   } catch (error) {
     console.error('🔴 Помилка створення ордерів безпеки:', error.message);
     telegram.sendError('create_safety_orders', error);
   }
 }
+
 
 async function checkPositionStatus() {
   console.log('🔍 Вхід у checkPositionStatus()', activePosition);
@@ -511,80 +563,110 @@ async function closePosition() {
     console.log(`🛑 Закриваємо позицію: ${activePosition.type} ${activePosition.totalAmount} ${config.symbol}`);
     const oppositeSide = activePosition.type === 'buy' ? 'sell' : 'buy';
 
+    // ⛔ Попередньо скасовуємо всі TP/SL ордери
     await cancelPositionOrders();
 
-    await safeExchangeCall(() => binance.createOrder(
-      config.symbol,
-      'MARKET',
-      oppositeSide,
-      activePosition.totalAmount
-    ));
+    // 🛒 Створюємо ринковий ордер на закриття
+    await safeExchangeCall(() =>
+      binance.createOrder(config.symbol, 'MARKET', oppositeSide, activePosition.totalAmount)
+    );
 
+    let retries = 10;
+    let positionClosed = false;
+
+    // ⏳ Очікуємо підтвердження, що позиція закрита
+    while (retries-- > 0) {
+      const positions = await binance.fetchPositions([config.symbol]);
+      const pos = positions.find(p => p.symbol.includes(config.symbol.split('/')[0]));
+      const positionAmt = parseFloat(pos?.contracts || 0);
+
+      if (positionAmt === 0) {
+        console.log('✅ Позиція повністю закрита');
+        positionClosed = true;
+        break;
+      }
+
+      console.log('⏳ Очікуємо закриття позиції...');
+      await new Promise(res => setTimeout(res, 1000));
+    }
+
+    // ⏹️ Повторна перевірка та скасування ордерів
+    await cancelPositionOrders();
+
+    // 🧹 Очистити локальний стан
     clearActivePosition();
 
-    telegram.sendMessage('Позиція успішно закрита');
+    telegram.sendMessage(
+      positionClosed
+        ? `✅ Позиція закрита та очищена (${config.symbol})`
+        : `⚠️ Позицію не вдалося повністю закрити (${config.symbol})`
+    );
+
+    // 🔁 Остання синхронізація
+    await syncPositionWithExchange();
+
   } catch (error) {
     console.error('🔴 Помилка закриття позиції:', error.message);
     telegram.sendError('close_position', error);
   }
 }
 
+
+
 async function openNewPosition(type, amount = config.tradeAmount) {
   try {
     if (!await checkExchangeConnection()) throw new Error('Відсутнє підключення до біржі');
 
-    if (validateActivePosition()) {
-  const isSameDirection =
-    (activePosition.type === 'buy' && type === 'buy') ||
-    (activePosition.type === 'sell' && type === 'sell');
+    // Отримуємо поточні позиції
+    const positions = await binance.fetchPositions([config.symbol]);
+    const pos = positions.find(p => p.symbol.includes(config.symbol.split('/')[0]));
+    const currentContracts = parseFloat(pos?.contracts || 0);
 
-  if (isSameDirection) {
-    console.log('➕ Докупка в ту ж сторону...');
-    const ticker = await safeExchangeCall(() => binance.fetchTicker(config.symbol));
-    const price = ticker.last;
+    if (currentContracts !== 0) {
+      const isLong = pos.side === 'long';
+      const incomingIsLong = type === 'buy';
 
-    const additionalAmount = config.tradeAmount;
+      if (isLong !== incomingIsLong) {
+        console.log('🔁 Позиція протилежна, закриваємо стару...');
+        await closePosition();
 
-    const totalCost = activePosition.entryPrice * activePosition.totalAmount;
-    const additionalCost = price * additionalAmount;
-    const newTotalAmount = activePosition.totalAmount + additionalAmount;
+        // Повторно перевіряємо після закриття
+        const updatedPositions = await binance.fetchPositions([config.symbol]);
+        const updatedPos = updatedPositions.find(p => p.symbol.includes(config.symbol.split('/')[0]));
+        const updatedContracts = parseFloat(updatedPos?.contracts || 0);
 
-    const newAverage = (totalCost + additionalCost) / newTotalAmount;
+        if (updatedContracts !== 0) {
+          console.log('❌ Позиція не закрилась, нову не відкриваємо');
+          return;
+        }
+      } else {
+        console.log(`⚠️ Позиція вже відкрита (${currentContracts}), нову не відкриваємо`);
+        return;
+      }
+    }
 
-    activePosition.entryPrice = newAverage;
-    activePosition.totalAmount = newTotalAmount;
+    // Баланс (перевірка в futures wallet)
+    const balance = await binance.fetchBalance({ type: 'future' });
+    const available = balance.total.USDT || 0;
 
-    await safeExchangeCall(() =>
-      binance.createOrder(config.symbol, 'MARKET', type, additionalAmount)
-    );
-
-    await updateSafetyOrders();
-
-    telegram.sendMessage(`📉 Докупка SHORT: ${additionalAmount} по ${price}, нова середня: ${newAverage.toFixed(2)}`);
-    return;
-  } else {
-    console.log('🔁 Сигнал протилежний. Закриваємо позицію...');
-    await closePosition();
-  }
-}
+    if (available < 10) {
+      console.log(`❌ Недостатньо маржі: ${available} USDT`);
+      telegram.sendMessage(`🚫 Недостатньо маржі: ${available} USDT`);
+      return;
+    }
 
     console.log(`🔵 Відкриваємо нову позицію: ${type} ${amount} ${config.symbol}`);
-
     const order = await safeExchangeCall(() =>
-      binance.createOrder(config.symbol, 'MARKET', type, amount)
+      binance.createOrder(config.symbol, 'market', type, amount)
     );
 
-    // 🧠 Автоматичне визначення entryPrice
     let entryPrice = order?.average || order?.fills?.[0]?.price;
-
     if (!entryPrice || isNaN(entryPrice)) {
       const ticker = await safeExchangeCall(() => binance.fetchTicker(config.symbol));
       entryPrice = ticker.last;
-      console.log(`📌 Ціна входу з ринку (fallback): ${entryPrice}`);
-    } else {
-      console.log(`📌 Ціна входу з ордера: ${entryPrice}`);
     }
 
+    // Зберігаємо активну позицію
     activePosition.id = generatePositionId();
     activePosition.type = type;
     activePosition.totalAmount = amount;
@@ -595,12 +677,12 @@ async function openNewPosition(type, amount = config.tradeAmount) {
     await updateSafetyOrders();
 
     telegram.sendMessage(`🟢 Нова позиція: ${type} ${amount} ${config.symbol} за ціною ${entryPrice}`);
-
   } catch (error) {
     console.error('🔴 Помилка відкриття позиції:', error.message);
     telegram.sendError('open_position', error);
   }
 }
+
 
 
 async function initializeTradingModule(providedBinance = null) {
@@ -628,6 +710,33 @@ async function initializeTradingModule(providedBinance = null) {
   }
 }
 
+
+
+function shouldDCA({ type, price }) {
+  if (!validateActivePosition()) return false;
+
+  const isSameDirection =
+    (activePosition.type === 'buy' && type === 'buy') ||
+    (activePosition.type === 'sell' && type === 'sell');
+
+  if (!isSameDirection) return false;
+
+  if (activePosition.dcaCount >= DCA_CONFIG.MAX_DCA_COUNT) return false;
+
+  const stepPercent = DCA_CONFIG.STEP_PERCENT / 100;
+  const thresholdPrice = activePosition.lastAveragePrice * (activePosition.type === 'buy'
+    ? (1 - stepPercent)
+    : (1 + stepPercent));
+
+  if ((type === 'buy' && price <= thresholdPrice) ||
+      (type === 'sell' && price >= thresholdPrice)) {
+    return true;
+  }
+
+  return false;
+}
+
+
 async function executeOrder(signal) {
   if (!binance) {
     binance = await binanceClientPromise();
@@ -636,12 +745,6 @@ async function executeOrder(signal) {
   }
 
   const { type } = signal;
-  const amount = config.tradeAmount; // ✅ беремо фіксовану кількість з config
-
-  if (!type || !amount) {
-    console.warn('⚠️ Некоректний сигнал для виконання');
-    return;
-  }
 
   const ticker = await safeExchangeCall(() => binance.fetchTicker(config.symbol));
   const price = ticker.last;
@@ -651,36 +754,46 @@ async function executeOrder(signal) {
     return;
   }
 
-  if (validateActivePosition()) {
-    const isSameDirection =
-      (activePosition.type === 'buy' && type === 'buy') ||
-      (activePosition.type === 'sell' && type === 'sell');
+  const isDCA = validateActivePosition() && shouldDCA({ type, price });
 
-    if (isSameDirection) {
-      console.log('➕ Докупка до існуючої позиції...');
+  const amount = isDCA
+    ? config.tradeAmount * Math.pow(DCA_CONFIG.MULTIPLIER, activePosition.dcaCount)
+    : config.tradeAmount;
+
+  if (!type || !amount) {
+    console.warn('⚠️ Некоректний сигнал для виконання');
+    return;
+  }
+
+  if (validateActivePosition()) {
+    if (isDCA) {
+      console.log('➕ Докупка до існуючої позиції (усереднення)...');
 
       const totalCost = activePosition.entryPrice * activePosition.totalAmount;
       const additionalCost = price * amount;
       const newTotalAmount = activePosition.totalAmount + amount;
       const newAveragePrice = (totalCost + additionalCost) / newTotalAmount;
 
-      // 🔄 оновлюємо позицію
       activePosition.entryPrice = newAveragePrice;
       activePosition.totalAmount = newTotalAmount;
+      activePosition.lastAveragePrice = newAveragePrice;
+      activePosition.trailingActivated = false;
+      activePosition.breakEvenReached = false;
 
-      // 🟢 виконуємо ринковий ордер
       await safeExchangeCall(() =>
         binance.createOrder(config.symbol, 'MARKET', type, amount)
       );
 
-      // 🔁 оновлення SL/TP
-      await updateSafetyOrders();
+      activePosition.dcaCount++;
 
-      telegram.sendMessage(`➕ Докупка ${amount} ${config.symbol} по ${price.toFixed(2)}. Нова ціна входу: ${newAveragePrice.toFixed(4)}`);
+      await updateSafetyOrders();
+      await checkPositionStatus();
+
+      telegram.sendMessage(`➕ Докупка ${amount} ${config.symbol} по ${price.toFixed(2)}. Нова середня: ${newAveragePrice.toFixed(4)}. Докупок: ${activePosition.dcaCount}/10`);
       return;
     } else {
-      console.log('🔁 Сигнал протилежний активній позиції, закриваємо...');
-      await closePosition();
+      console.log('⛔ Докупка не виконується (умови не виконано або досягнуто ліміт)');
+      return;
     }
   }
 
@@ -690,15 +803,16 @@ async function executeOrder(signal) {
     binance.createOrder(config.symbol, 'MARKET', type, amount)
   );
 
-  // 💡 ціна входу
   const entryPrice = parseFloat(order?.fills?.[0]?.price) || price;
 
   activePosition.id = generatePositionId();
   activePosition.type = type;
   activePosition.totalAmount = amount;
   activePosition.entryPrice = entryPrice;
+  activePosition.lastAveragePrice = entryPrice;
   activePosition.breakEvenReached = false;
   activePosition.trailingActivated = false;
+  activePosition.dcaCount = 0;
 
   await updateSafetyOrders();
 
@@ -726,4 +840,6 @@ module.exports = {
   updateTrailingStop,
   getActivePosition,
   openNewPosition,
+  executeOrder
 };
+

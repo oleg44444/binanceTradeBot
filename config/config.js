@@ -1,9 +1,9 @@
 require('dotenv').config();
 
 module.exports = {
-    symbol: 'SOL/USDT',
-    timeframe: '15m',
-    tradeAmount: 3,
+    symbol: 'SOLUSDT',
+    timeframe: '5m',
+    tradeAmount: 5,
     leverage: 20,
     updateInterval: 30000,
     maxRequestsPerMinute: 50,
@@ -12,6 +12,11 @@ module.exports = {
         apiSecret: process.env.BINANCE_API_SECRET,
         testnet: true
     },
+    DCA_CONFIG: {
+        MAX_DCA_COUNT: 10,
+        STEP_PERCENT: 1, // наприклад, 1.5% відстань між докупками
+        MULTIPLIER: 0.8    // коефіцієнт збільшення кожної наступної докупки
+      },
     telegram: {
         token: process.env.TELEGRAM_BOT_TOKEN,
         chatId: process.env.TELEGRAM_CHAT_ID 

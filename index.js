@@ -5,6 +5,7 @@ const { checkBuySignal, checkSellSignal } = require('./strategy/strategy');
 const config = require('./config/config');
 const binanceClientPromise = require('./utils/binanceClient');
 const { initializeTradingModule } = require('./trading/executeOrder');
+const { syncPositionWithExchange}= require('./trading/executeOrder')
 const { handleTradeSignal } = require('./trading/positionManager');
 
 let binance;
@@ -39,6 +40,7 @@ async function initializeBot() {
     console.log(`✅ Налаштовано плече: ${config.leverage || 20}x`);
 
     trading = await initializeTradingModule(binance);
+    await trading.syncPositionWithExchange?.();
     const balance = await trading.getAccountBalance();
     console.log(`💰 Початковий баланс: ${balance.toFixed(2)} USDT`);
 
@@ -62,8 +64,8 @@ async function runTradingCycle() {
       return;
     }
 
-    const closes = candles.map(c => c.close);
-    const currentPrice = closes.at(-1);
+    const closes = candles.map(c => c[4]); // [open, high, low, close] => close
+const currentPrice = closes.at(-1);
     console.log(`📊 Поточна ціна: ${currentPrice}`);
 
     const buySignal = checkBuySignal(closes);

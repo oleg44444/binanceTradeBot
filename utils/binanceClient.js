@@ -141,7 +141,7 @@ async function initializeBinanceClient() {
       const binanceInstance = createBinanceClient(apiKey, apiSecret);
 
       // Завантаження ринків
-      console.log('📥 Завантаження ринків...');
+     
       await binanceInstance.loadMarkets();
       console.log('✅ Ринки завантажено');
 
@@ -193,8 +193,8 @@ async function initializeBinanceClient() {
       let balanceInfo = 'невідомий';
       
       try {
-        const balance = await binanceInstance.fetchBalance();
-        
+        const balance = await binanceInstance.fetchBalance({ type: 'future' });
+
         if (balance && typeof balance === 'object') {
           usdtBalance = balance.total?.USDT || 
                        balance.USDT?.total || 
