@@ -1,3 +1,4 @@
+const logger = require('../utils/logger');
 const { openNewPosition, closePosition } = require('./executeOrder');
 
 /**
@@ -9,15 +10,13 @@ const { openNewPosition, closePosition } = require('./executeOrder');
  */
 async function handleTradeSignal(type, price, amount, stops) {
   try {
-    console.log('📍 handleTradeSignal викликаний');
-    console.log(`   Тип: ${type}, Ціна: ${price}, Кількість: ${amount}`);
-    console.log(`   Стопи: SL=${stops.stopLoss.toFixed(4)}, TP=${stops.takeProfit.toFixed(4)}`);
+    logger.debug(`Обробка сигналу: ${type} @ ${price.toFixed(4)}, SL=${stops.stopLoss.toFixed(4)}, TP=${stops.takeProfit.toFixed(4)}`);
 
     // ✅ Передаємо стопи в openNewPosition
     await openNewPosition(type, amount, price, stops);
 
   } catch (error) {
-    console.error('🔴 Помилка обробки сигналу:', error.message);
+    logger.error('Помилка обробки сигналу', error);
     throw error;
   }
 }
