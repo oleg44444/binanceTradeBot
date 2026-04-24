@@ -1,68 +1,98 @@
 /**
- * Розрахунок локальних хвиль (wave analysis)
- * Знаходить локальні максимуми та мінімуми за останні N свічок
+ * Аналіз хвильових патернів
+ * Визначає локальні максимуми та мінімуми дл�� ідентифікації сигналів
  */
 
-function calculateWavePatterns(candles, waveLengthDynamic = 8) {
-    if (candles.length < waveLengthDynamic) {
+/**
+ * Розрахунок локальних максимумів і мінімумів
+ * @param {number[]} highs - Масив найвищих цін
+ * @param {number[]} lows - Масив найнищих цін
+ * @param {number} waveLength - Період для розрахунку (динамічний або фіксований)
+ * @returns {object} - {waveHigh, waveLow}
+ */
+function calculateWavePatterns(highs, lows, waveLength = 12) {
+    const length = highs.length;
+    
+    if (length < waveLength) {
       return {
-        isValid: false,
         waveHigh: null,
         waveLow: null,
-        waveChangeUp: 0,
-        waveChangeDown: 0,
-        lastWaveHigh: null,
-        lastWaveLow: null
+        waveHighIndex: -1,
+        waveLowIndex: -1
       };
     }
-  
-    const highs = candles.map(c => c[1]);
-    const lows = candles.map(c => c[2]);
     
-    // Локальний максимум - найвища ��очка за останні N свічок
-    const waveHigh = Math.max(...highs.slice(-waveLengthDynamic));
+    // Отримуємо локальний максимум за останні N свічок
+    let waveHigh = highs[length - waveLength];
+    let waveHighIndex = length - waveLength;
     
-    // Локальний мінімум - найнижча точка за останні N свічок
-    const waveLow = Math.min(...lows.slice(-waveLengthDynamic));
+    for (let i = length - waveLength; i < length; i++) {
+      if (highs[i] > waveHigh) {
+        waveHigh = highs[i];
+        waveHighIndex = i;
+      }
+    }
     
-    // Останній максимум та мінімум
-    const currentHigh = highs[highs.length - 1];
-    const currentLow = lows[lows.length - 1];
+    // Отримуємо локальний мінімум за останні N свічок
+    let waveLow = lows[length - waveLength];
+    let waveLowIndex = length - waveLength;
     
-    // Відсоток зміни від хвильового мінімуму до поточної ціни
-    const waveChangeUp = waveLow > 0 ? (currentHigh - waveLow) / waveLow : 0;
-    
-    // Відсоток зміни від поточної ціни до хвильового максимуму
-    const waveChangeDown = waveHigh > 0 ? (waveHigh - currentLow) / waveHigh : 0;
+    for (let i = length - waveLength; i < length; i++) {
+      if (lows[i] < waveLow) {
+        waveLow = lows[i];
+        waveLowIndex = i;
+      }
+    }
     
     return {
-      isValid: true,
       waveHigh,
       waveLow,
-      waveChangeUp,
-      waveChangeDown,
-      currentHigh,
-      currentLow
+      waveHighIndex,
+      waveLowIndex
     };
   }
   
   /**
-   * Динамічна довжина хвилі на основі ATR
+   * Розрахунок динамічної довжини хвилі на основі ATR
    * @param {number} atr - Поточне значення ATR
-   * @param {number} minWaveLength - Мінімальна довжина хвилі
-   * @param {number} maxWaveLength - Максимальна довжина хвилі
+   * @param {number} minWaveLength - Мінімальна довжина (за замовчуванням 8)
+   * @param {number} maxWaveLength - Максимальна довжина (за замовчуванням 21)
+   * @returns {number} - Розраховується довжина хвилі
    */
   function calculateDynamicWaveLength(atr, minWaveLength = 8, maxWaveLength = 21) {
-    if (atr === null || atr === undefined) {
+    if (!atr || atr === null) {
       return minWaveLength;
     }
     
+    // Динамічна довжина = ATR * 10, але обмежена min/max
     const waveLengthRaw = atr * 10;
-    return Math.round(Math.min(Math.max(waveLengthRaw, minWaveLength), maxWaveLength));
+    const waveLengthDynamic = Math.round(
+      Math.min(Math.max(waveLengthRaw, minWaveLength), maxWaveLength)
+    );
+    
+    return waveLengthDynamic > 0 ? waveLengthDynamic : minWaveLength;
+  }
+  
+  /**
+   * Розрахунок зміни хвилі (%) для виявлення сигналів
+   * @param {number} currentPrice - Поточна ціна
+   * @param {number} waveLow - Локальний мінімум
+   * @param {number} waveHigh - Локальний максимум
+   * @returns {object} - {waveChangeUp, waveChangeDown}
+   */
+  function calculateWaveChange(currentPrice, waveLow, waveHigh) {
+    const waveChangeUp = waveLow !== 0 ? (currentPrice - waveLow) / waveLow : 0;
+    const waveChangeDown = waveHigh !== 0 ? (waveHigh - currentPrice) / waveHigh : 0;
+    
+    return {
+      waveChangeUp,
+      waveChangeDown
+    };
   }
   
   module.exports = {
     calculateWavePatterns,
-    calculateDynamicWaveLength
+    calculateDynamicWaveLength,
+    calculateWaveChange
   };
   

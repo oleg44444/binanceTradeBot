@@ -1,182 +1,202 @@
 const { calculateMACD, isMACDCrossover, isMACDCrossunder } = require('../indicators/macd');
-const { calculateATR } = require('../indicators/atr');
-const { calculateWavePatterns, calculateDynamicWaveLength } = require('../indicators/waves');
-
-// Параметри стратегії
-const STRATEGY_PARAMS = {
-  minWaveLength: 8,
-  maxWaveLength: 21,
-  atrLength: 14,
-  atrMultiplierSL: 1.0,      // ATR множник для стоп-лоссу
-  atrMultiplierTP: 5.0,      // ATR множник для тейк-профіту
-  atrMultiplierTrail: 1.0,   // ATR множник для трейлінг-стопу
-  
-  macdFast: 12,
-  macdSlow: 26,
-  macdSignal: 9,
-  
-  waveThreshold: 0.003       // 0.3% - поріг для сигналу на волні
-};
+const { calculateATR, getLastATR } = require('../indicators/atr');
+const { 
+  calculateWavePatterns, 
+  calculateDynamicWaveLength, 
+  calculateWaveChange 
+} = require('../indicators/ waves');
 
 /**
- * Розрахунок всіх індикаторів для стратегії
+ * Перевірка BUY сигналу за стратегією TradingView
+ * Умови:
+ * 1. Хвиля йде ВГОРУ > 0.3%
+ * 2. MACD перетинає Signal Line (crossover)
+ * 3. Ціна > локального мінімуму хвилі
  */
-function calculateAllIndicators(candles) {
-  try {
-    // Розпакуємо OHLCV
-    const opens = candles.map(c => c[0]);
-    const closes = candles.map(c => c[4]);
-    
-    // Розраховуємо ATR
-    const atrValues = calculateATR(candles, STRATEGY_PARAMS.atrLength);
-    const atr = atrValues[atrValues.length - 1];
-    
-    // Розраховуємо динамічну довжину хвилі
-    const waveLengthDynamic = calculateDynamicWaveLength(
-      atr,
-      STRATEGY_PARAMS.minWaveLength,
-      STRATEGY_PARAMS.maxWaveLength
-    );
-    
-    // Розраховуємо хвильові патерни
-    const waveWindow = Math.max(waveLengthDynamic, STRATEGY_PARAMS.maxWaveLength);
-    const candlesWindow = candles.slice(-Math.max(50, waveWindow));
-    const waves = calculateWavePatterns(candlesWindow, waveLengthDynamic);
-    
-    // Розраховуємо MACD
-    const macd = calculateMACD(
-      closes.slice(-Math.max(100, STRATEGY_PARAMS.macdSlow + STRATEGY_PARAMS.macdSignal)),
-      STRATEGY_PARAMS.macdFast,
-      STRATEGY_PARAMS.macdSlow,
-      STRATEGY_PARAMS.macdSignal
-    );
-    
-    return {
-      atr,
-      atrValues,
-      waveLengthDynamic,
-      waves,
-      macd,
-      closes: closes.slice(-100),
-      currentPrice: closes[closes.length - 1],
-      isValid: atr !== null && waves.isValid && macd.isValid
-    };
-  } catch (error) {
-    console.error('🔴 Помилка розрахунку індикаторів:', error.message);
-    return {
-      isValid: false,
-      error: error.message
-    };
-  }
-}
+function checkBuySignal(candles, config = {}) {
+  const {
+    minWaveLength = 8,
+    maxWaveLength = 21,
+    waveThreshold = 0.003, // 0.3%
+    atrLength = 14,
+    macdFast = 12,
+    macdSlow = 26,
+    macdSignal = 9
+  } = config;
 
-/**
- * Перевірка сигналу на покупку (LONG)
- * 1. Хвиля йде вгору більше ніж на 0.3%
- * 2. MACD перетинає сигнальну лінію знизу (вгору)
- * 3. Ціна вище локального мінімуму хвилі
- */
-function checkBuySignal(indicators) {
-  if (!indicators.isValid) {
-    return {
-      signal: false,
-      reason: 'Недостатньо даних для аналізу'
-    };
+  const closes = candles.map(c => c[4]);
+  const highs = candles.map(c => c[2]);
+  const lows = candles.map(c => c[3]);
+  const currentPrice = closes[closes.length - 1];
+
+  // Розраховуємо ATR
+  const atr = calculateATR(highs, lows, closes, atrLength);
+  const currentATR = getLastATR(atr);
+
+  if (!currentATR) {
+    console.log('❌ BUY: Недостатньо даних для ATR');
+    return { signal: false, details: {} };
   }
-  
-  const { waves, macd, currentPrice } = indicators;
-  
-  // Умова 1: Хвиля йде вгору
-  const waveUpCondition = waves.waveChangeUp > STRATEGY_PARAMS.waveThreshold;
-  
-  // Умова 2: MACD crossover (перетин вгору)
-  const macdCrossoverCondition = isMACDCrossover(macd.macdLine, macd.signalLine);
-  
-  // Умова 3: Ціна вище локального мінімуму
-  const priceConfirm = currentPrice > waves.waveLow;
-  
-  const signal = waveUpCondition && macdCrossoverCondition && priceConfirm;
-  
+
+  // Розраховуємо динамічну довжину хвилі
+  const waveLength = calculateDynamicWaveLength(currentATR, minWaveLength, maxWaveLength);
+
+  // Розраховуємо хвильові патерни
+  const { waveHigh, waveLow } = calculateWavePatterns(highs, lows, waveLength);
+
+  if (waveHigh === null || waveLow === null) {
+    console.log('❌ BUY: Недостатньо даних для хвиль');
+    return { signal: false, details: {} };
+  }
+
+  // Розраховуємо зміну хвилі
+  const { waveChangeUp } = calculateWaveChange(currentPrice, waveLow, waveHigh);
+
+  // Перевіряємо умову 1: Хвиля вгору > 0.3%
+  const waveUpCondition = waveChangeUp > waveThreshold;
+
+  // Розраховуємо MACD
+  const { macdLine, signalLine, isValid: macdValid } = calculateMACD(
+    closes,
+    macdFast,
+    macdSlow,
+    macdSignal
+  );
+
+  if (!macdValid) {
+    console.log('❌ BUY: Недостатньо даних для MACD');
+    return { signal: false, details: {} };
+  }
+
+  // Перевіряємо умову 2: MACD crossover
+  const macdCrossover = isMACDCrossover(macdLine, signalLine);
+
+  // Перевіряємо умову 3: Ціна > локального мінімуму
+  const priceConfirm = currentPrice > waveLow;
+
+  const signal = waveUpCondition && macdCrossover && priceConfirm;
+
+  console.log(`
+  📊 === BUY SIGNAL ANALYSIS ===
+  🌊 Wave Up: ${(waveChangeUp * 100).toFixed(3)}% (${waveUpCondition ? '✅' : '❌'} > ${(waveThreshold * 100).toFixed(1)}%)
+  📈 MACD Crossover: ${macdCrossover ? '✅' : '❌'}
+  💹 Price > Wave Low: ${currentPrice.toFixed(4)} > ${waveLow.toFixed(4)} (${priceConfirm ? '✅' : '❌'})
+  📍 Wave High: ${waveHigh.toFixed(4)}, Wave Low: ${waveLow.toFixed(4)}
+  🎯 RESULT: ${signal ? '✅ BUY SIGNAL' : '❌ NO SIGNAL'}
+  `);
+
   return {
     signal,
-    waveUpCondition,
-    macdCrossoverCondition,
-    priceConfirm,
-    waveChangeUp: waves.waveChangeUp,
-    waveLow: waves.waveLow,
-    currentPrice,
-    macdLine: macd.macdLine[macd.macdLine.length - 1],
-    signalLine: macd.signalLine[macd.signalLine.length - 1]
+    details: {
+      waveChangeUp,
+      waveUpCondition,
+      macdCrossover,
+      priceConfirm,
+      currentPrice,
+      waveLow,
+      waveHigh,
+      currentATR,
+      waveLength
+    }
   };
 }
 
 /**
- * Перевірка сигналу на продаж (SHORT)
- * 1. Хвиля йде вниз більше ніж на 0.3%
- * 2. MACD перетинає сигнальну лінію зверху (вниз)
- * 3. Ціна нижче локального максимуму хвилі
+ * Перевірка SELL сигналу за стратегією TradingView
+ * Умови:
+ * 1. Хвиля йде ВНИЗ > 0.3%
+ * 2. MACD перетинає Signal Line (crossunder)
+ * 3. Ціна < локального максимуму хвилі
  */
-function checkSellSignal(indicators) {
-  if (!indicators.isValid) {
-    return {
-      signal: false,
-      reason: 'Недостатньо даних для аналізу'
-    };
+function checkSellSignal(candles, config = {}) {
+  const {
+    minWaveLength = 8,
+    maxWaveLength = 21,
+    waveThreshold = 0.003, // 0.3%
+    atrLength = 14,
+    macdFast = 12,
+    macdSlow = 26,
+    macdSignal = 9
+  } = config;
+
+  const closes = candles.map(c => c[4]);
+  const highs = candles.map(c => c[2]);
+  const lows = candles.map(c => c[3]);
+  const currentPrice = closes[closes.length - 1];
+
+  // Розраховуємо ATR
+  const atr = calculateATR(highs, lows, closes, atrLength);
+  const currentATR = getLastATR(atr);
+
+  if (!currentATR) {
+    console.log('❌ SELL: Недостатньо даних для ATR');
+    return { signal: false, details: {} };
   }
-  
-  const { waves, macd, currentPrice } = indicators;
-  
-  // Умова 1: Хвиля йде вниз
-  const waveDownCondition = waves.waveChangeDown > STRATEGY_PARAMS.waveThreshold;
-  
-  // Умова 2: MACD crossunder (перетин вниз)
-  const macdCrossunderCondition = isMACDCrossunder(macd.macdLine, macd.signalLine);
-  
-  // Умова 3: Ціна нижче локального максимуму
-  const priceConfirm = currentPrice < waves.waveHigh;
-  
-  const signal = waveDownCondition && macdCrossunderCondition && priceConfirm;
-  
+
+  // Розраховуємо динамічну довжину хвилі
+  const waveLength = calculateDynamicWaveLength(currentATR, minWaveLength, maxWaveLength);
+
+  // Розраховуємо хвильові патерни
+  const { waveHigh, waveLow } = calculateWavePatterns(highs, lows, waveLength);
+
+  if (waveHigh === null || waveLow === null) {
+    console.log('❌ SELL: Недостатньо даних для хвиль');
+    return { signal: false, details: {} };
+  }
+
+  // Розраховуємо зміну хвилі
+  const { waveChangeDown } = calculateWaveChange(currentPrice, waveLow, waveHigh);
+
+  // Перевіряємо умову 1: Хвиля вниз > 0.3%
+  const waveDownCondition = waveChangeDown > waveThreshold;
+
+  // Розраховуємо MACD
+  const { macdLine, signalLine, isValid: macdValid } = calculateMACD(
+    closes,
+    macdFast,
+    macdSlow,
+    macdSignal
+  );
+
+  if (!macdValid) {
+    console.log('❌ SELL: Недостатньо даних для MACD');
+    return { signal: false, details: {} };
+  }
+
+  // Перевіряємо умову 2: MACD crossunder
+  const macdCrossunder = isMACDCrossunder(macdLine, signalLine);
+
+  // Перевіряємо умову 3: Ціна < локального максимуму
+  const priceConfirm = currentPrice < waveHigh;
+
+  const signal = waveDownCondition && macdCrossunder && priceConfirm;
+
+  console.log(`
+  📊 === SELL SIGNAL ANALYSIS ===
+  🌊 Wave Down: ${(waveChangeDown * 100).toFixed(3)}% (${waveDownCondition ? '✅' : '❌'} > ${(waveThreshold * 100).toFixed(1)}%)
+  📉 MACD Crossunder: ${macdCrossunder ? '✅' : '❌'}
+  💹 Price < Wave High: ${currentPrice.toFixed(4)} < ${waveHigh.toFixed(4)} (${priceConfirm ? '✅' : '❌'})
+  📍 Wave High: ${waveHigh.toFixed(4)}, Wave Low: ${waveLow.toFixed(4)}
+  🎯 RESULT: ${signal ? '✅ SELL SIGNAL' : '❌ NO SIGNAL'}
+  `);
+
   return {
     signal,
-    waveDownCondition,
-    macdCrossunderCondition,
-    priceConfirm,
-    waveChangeDown: waves.waveChangeDown,
-    waveHigh: waves.waveHigh,
-    currentPrice,
-    macdLine: macd.macdLine[macd.macdLine.length - 1],
-    signalLine: macd.signalLine[macd.signalLine.length - 1]
+    details: {
+      waveChangeDown,
+      waveDownCondition,
+      macdCrossunder,
+      priceConfirm,
+      currentPrice,
+      waveHigh,
+      waveLow,
+      currentATR,
+      waveLength
+    }
   };
-}
-
-/**
- * Розрахунок стоп-лосу та тейк-профіту на основі ATR
- */
-function calculateStopsAndTP(entryPrice, atr, side) {
-  const sl = atr * STRATEGY_PARAMS.atrMultiplierSL;
-  const tp = atr * STRATEGY_PARAMS.atrMultiplierTP;
-  const trail = atr * STRATEGY_PARAMS.atrMultiplierTrail;
-  
-  if (side === 'long') {
-    return {
-      stopLoss: entryPrice - sl,
-      takeProfit: entryPrice + tp,
-      trailingStopDistance: trail
-    };
-  } else {
-    return {
-      stopLoss: entryPrice + sl,
-      takeProfit: entryPrice - tp,
-      trailingStopDistance: trail
-    };
-  }
 }
 
 module.exports = {
-  STRATEGY_PARAMS,
-  calculateAllIndicators,
   checkBuySignal,
-  checkSellSignal,
-  calculateStopsAndTP
+  checkSellSignal
 };

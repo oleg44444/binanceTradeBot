@@ -1,23 +1,25 @@
-const { closePosition, openNewPosition, getActivePosition, executeOrder } = require('./executeOrder');
+const { openNewPosition, closePosition } = require('./executeOrder');
 
-async function handleTradeSignal(type, price, amount) {
-  const active = await getActivePosition();
+/**
+ * Обробка торгового сигналу
+ * @param {string} type - 'buy' або 'sell'
+ * @param {number} price - поточна ціна входу
+ * @param {number} amount - розмір позиції
+ * @param {object} stops - {stopLoss, takeProfit, trailingStopDistance}
+ */
+async function handleTradeSignal(type, price, amount, stops) {
+  try {
+    console.log('📍 handleTradeSignal викликаний');
+    console.log(`   Тип: ${type}, Ціна: ${price}, Кількість: ${amount}`);
+    console.log(`   Стопи: SL=${stops.stopLoss.toFixed(4)}, TP=${stops.takeProfit.toFixed(4)}`);
 
-  const isSameDirection = active.isOpen && active.side === (type === 'buy' ? 'long' : 'short');
+    // ✅ Передаємо стопи в openNewPosition
+    await openNewPosition(type, amount, price, stops);
 
-  if (isSameDirection) {
-    console.log(`➕ Докупка в ту ж сторону (${type.toUpperCase()})`);
-    await executeOrder({ type, price });
-    return;
+  } catch (error) {
+    console.error('🔴 Помилка обробки сигналу:', error.message);
+    throw error;
   }
-
-  if (active.isOpen) {
-    console.log(`🔁 Закриваємо протилежну позицію (${active.side})`);
-    await closePosition();
-  }
-
-  console.log(`🟢 Відкриваємо нову позицію (${type}) по ціні ${price}`);
-  await openNewPosition(type, amount);
 }
 
 module.exports = {
