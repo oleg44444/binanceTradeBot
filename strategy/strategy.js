@@ -1,202 +1,252 @@
+/**
+ * strategy.js
+ * Точна реалізація Pine Script стратегії:
+ * "Інноваційна хвильова стратегія з адаптивністю + Trailing Stop"
+ *
+ * Ключові відмінності від попередньої версії:
+ * - lastWaveLow/lastWaveHigh — накопичувальні (як `var float` в Pine)
+ * - waveChangeUp  = (high - lastWaveLow)  / lastWaveLow   (від HIGH свічки)
+ * - waveChangeDown = (lastWaveHigh - low) / lastWaveHigh  (від LOW свічки)
+ * - SL/TP/Trail рахуються від CLOSE на момент сигналу, множники ATR як в Pine
+ */
+
 const { calculateMACD, isMACDCrossover, isMACDCrossunder } = require('../indicators/macd');
 const { calculateATR, getLastATR } = require('../indicators/atr');
-const { 
-  calculateWavePatterns, 
-  calculateDynamicWaveLength, 
-  calculateWaveChange 
-} = require('../indicators/waves');
+const { calculateDynamicWaveLength } = require('../indicators/waves');
+
+// ─── Параметри за замовчуванням (відповідають input-ам в Pine) ────────────────
+const DEFAULTS = {
+  minWaveLength:       8,
+  maxWaveLength:       21,
+  atrLength:           14,
+  atrMultiplierSL:     1.0,   // stop    = close ± atr * 1.0
+  atrMultiplierTP:     5.0,   // limit   = close ± atr * 5.0
+  atrMultiplierTrail:  1.0,   // trail   = atr * 1.0
+  waveThreshold:       0.003, // 0.3%
+  macdFast:            12,
+  macdSlow:            26,
+  macdSignal:          9
+};
 
 /**
- * Перевірка BUY сигналу за стратегією TradingView
- * Умови:
- * 1. Хвиля йде ВГОРУ > 0.3%
- * 2. MACD перетинає Signal Line (crossover)
- * 3. Ціна > локального мінімуму хвилі
+ * Обчислює накопичувальні lastWaveLow / lastWaveHigh по всій історії свічок —
+ * точно як `var float` змінні в Pine Script.
+ *
+ * Pine:
+ *   if (na(lastWaveLow) or low < lastWaveLow)  lastWaveLow  := low
+ *   if (na(lastWaveHigh) or high > lastWaveHigh) lastWaveHigh := high
+ *
+ * @param {number[]} highs
+ * @param {number[]} lows
+ * @returns {{ lastWaveHigh: number, lastWaveLow: number }}
  */
-function checkBuySignal(candles, config = {}) {
-  const {
-    minWaveLength = 8,
-    maxWaveLength = 21,
-    waveThreshold = 0.003, // 0.3%
-    atrLength = 14,
-    macdFast = 12,
-    macdSlow = 26,
-    macdSignal = 9
-  } = config;
+function calcRunningWaveExtremes(highs, lows) {
+  let lastWaveLow  = null;
+  let lastWaveHigh = null;
+
+  for (let i = 0; i < highs.length; i++) {
+    if (lastWaveLow  === null || lows[i]  < lastWaveLow)  lastWaveLow  = lows[i];
+    if (lastWaveHigh === null || highs[i] > lastWaveHigh) lastWaveHigh = highs[i];
+  }
+
+  return { lastWaveHigh, lastWaveLow };
+}
+
+/**
+ * Головна функція розрахунку індикаторів.
+ *
+ * @param {Array}       candles   - OHLCV свічки [[ts, o, h, l, c, v], ...]
+ * @param {object}      cfg       - перевизначення параметрів (опціонально)
+ * @param {number|null} livePrice - поточна ціна з fetchTicker (для currentClose)
+ * @returns {object}
+ */
+function calculateAllIndicators(candles, cfg = {}, livePrice = null) {
+  const p = { ...DEFAULTS, ...cfg };
 
   const closes = candles.map(c => c[4]);
-  const highs = candles.map(c => c[2]);
-  const lows = candles.map(c => c[3]);
-  const currentPrice = closes[closes.length - 1];
+  const highs  = candles.map(c => c[2]);
+  const lows   = candles.map(c => c[3]);
 
-  // Розраховуємо ATR
-  const atr = calculateATR(highs, lows, closes, atrLength);
-  const currentATR = getLastATR(atr);
+  // Поточна ціна закриття — жива якщо є, інакше остання свічка
+  const currentClose = (livePrice && !isNaN(Number(livePrice)))
+    ? Number(livePrice)
+    : closes[closes.length - 1];
 
-  if (!currentATR) {
-    console.log('❌ BUY: Недостатньо даних для ATR');
-    return { signal: false, details: {} };
+  // Поточні high/low останньої (незакритої або останньої закритої) свічки
+  const currentHigh = highs[highs.length - 1];
+  const currentLow  = lows[lows.length - 1];
+
+  // ── ATR ──────────────────────────────────────────────────────────────────
+  const atrArray   = calculateATR(highs, lows, closes, p.atrLength);
+  const currentATR = getLastATR(atrArray);
+
+  if (!currentATR) return { isValid: false, reason: 'ATR: недостатньо даних' };
+
+  // ── Динамічна довжина хвилі ───────────────────────────────────────────────
+  // Pine: waveLengthDynamicRaw = atr * 10
+  //       waveLengthDynamic = round(clamp(raw, min, max))
+  const waveLength = calculateDynamicWaveLength(currentATR, p.minWaveLength, p.maxWaveLength);
+
+  // ── Локальні хвилі (ta.highest / ta.lowest) ───────────────────────────────
+  // Pine: waveHigh = ta.highest(high, waveLengthDynamic)
+  //       waveLow  = ta.lowest(low,  waveLengthDynamic)
+  const sliceHighs = highs.slice(-waveLength);
+  const sliceLows  = lows.slice(-waveLength);
+  const waveHigh   = Math.max(...sliceHighs);
+  const waveLow    = Math.min(...sliceLows);
+
+  // ── Накопичувальні екстремуми (var float у Pine) ──────────────────────────
+  const { lastWaveHigh, lastWaveLow } = calcRunningWaveExtremes(highs, lows);
+
+  if (lastWaveLow === null || lastWaveHigh === null) {
+    return { isValid: false, reason: 'Waves: недостатньо даних' };
   }
 
-  // Розраховуємо динамічну довжину хвилі
-  const waveLength = calculateDynamicWaveLength(currentATR, minWaveLength, maxWaveLength);
+  // ── Зміна хвилі ──────────────────────────────────────────────────────────
+  // Pine: waveChangeUp   = (high - lastWaveLow)  / lastWaveLow
+  //       waveChangeDown = (lastWaveHigh - low)  / lastWaveHigh
+  const waveChangeUp   = lastWaveLow  !== 0 ? (currentHigh - lastWaveLow)  / lastWaveLow  : 0;
+  const waveChangeDown = lastWaveHigh !== 0 ? (lastWaveHigh - currentLow) / lastWaveHigh  : 0;
 
-  // Розраховуємо хвильові патерни
-  const { waveHigh, waveLow } = calculateWavePatterns(highs, lows, waveLength);
-
-  if (waveHigh === null || waveLow === null) {
-    console.log('❌ BUY: Недостатньо даних для хвиль');
-    return { signal: false, details: {} };
-  }
-
-  // Розраховуємо зміну хвилі
-  const { waveChangeUp } = calculateWaveChange(currentPrice, waveLow, waveHigh);
-
-  // Перевіряємо умову 1: Хвиля вгору > 0.3%
-  const waveUpCondition = waveChangeUp > waveThreshold;
-
-  // Розраховуємо MACD
+  // ── MACD ─────────────────────────────────────────────────────────────────
   const { macdLine, signalLine, isValid: macdValid } = calculateMACD(
-    closes,
-    macdFast,
-    macdSlow,
-    macdSignal
+    closes, p.macdFast, p.macdSlow, p.macdSignal
   );
 
-  if (!macdValid) {
-    console.log('❌ BUY: Недостатньо даних для MACD');
-    return { signal: false, details: {} };
-  }
+  if (!macdValid) return { isValid: false, reason: 'MACD: недостатньо даних' };
 
-  // Перевіряємо умову 2: MACD crossover
-  const macdCrossover = isMACDCrossover(macdLine, signalLine);
+  return {
+    isValid: true,
+    // Ціни
+    currentClose,
+    currentHigh,
+    currentLow,
+    // ATR
+    atr: currentATR,
+    // Хвилі
+    waveLength,
+    waves: {
+      waveHigh,
+      waveLow,
+      lastWaveHigh,
+      lastWaveLow,
+      waveChangeUp,
+      waveChangeDown,
+      waveThreshold: p.waveThreshold
+    },
+    // MACD
+    macd: { macdLine, signalLine },
+    // Множники для стопів
+    multipliers: {
+      sl:    p.atrMultiplierSL,
+      tp:    p.atrMultiplierTP,
+      trail: p.atrMultiplierTrail
+    }
+  };
+}
 
-  // Перевіряємо умову 3: Ціна > локального мінімуму
-  const priceConfirm = currentPrice > waveLow;
+/**
+ * Розрахунок SL / TP / Trail — точно як в Pine strategy.exit:
+ *
+ * Long:  stop  = close - atr * atrMultiplierSL
+ *        limit = close + atr * atrMultiplierTP
+ *        trail = atr * atrMultiplierTrail
+ *
+ * Short: stop  = close + atr * atrMultiplierSL
+ *        limit = close - atr * atrMultiplierTP
+ *        trail = atr * atrMultiplierTrail
+ *
+ * @param {number} closePrice  - ціна закриття в момент сигналу
+ * @param {number} atr         - поточний ATR
+ * @param {string} side        - 'long' | 'short'
+ * @param {object} multipliers - {sl, tp, trail}
+ */
+function calculateStopsAndTP(closePrice, atr, side, multipliers = {}) {
+  const sl    = multipliers.sl    ?? DEFAULTS.atrMultiplierSL;
+  const tp    = multipliers.tp    ?? DEFAULTS.atrMultiplierTP;
+  const trail = multipliers.trail ?? DEFAULTS.atrMultiplierTrail;
 
-  const signal = waveUpCondition && macdCrossover && priceConfirm;
+  const slDist    = atr * sl;
+  const tpDist    = atr * tp;
+  const trailDist = atr * trail;
+
+  const stopLoss   = side === 'long' ? closePrice - slDist : closePrice + slDist;
+  const takeProfit = side === 'long' ? closePrice + tpDist : closePrice - tpDist;
+
+  return {
+    stopLoss:             Number(stopLoss.toFixed(4)),
+    takeProfit:           Number(takeProfit.toFixed(4)),
+    trailingStopDistance: Number(trailDist.toFixed(4))
+  };
+}
+
+/**
+ * Перевірка LONG сигналу.
+ * Pine:
+ *   longWaveCondition = waveChangeUp > 0.003
+ *   longMacdCondition = ta.crossover(macdLine, signalLine)
+ *   longConfirm       = longWaveCondition and longMacdCondition and close > lastWaveLow
+ */
+function checkBuySignal(indicators) {
+  if (!indicators?.isValid) return { signal: false, details: {} };
+
+  const { currentClose, currentHigh, waves, macd } = indicators;
+  const { waveChangeUp, waveThreshold, lastWaveLow, lastWaveHigh, waveHigh, waveLow } = waves;
+  const { macdLine, signalLine } = macd;
+
+  const waveOk  = waveChangeUp > waveThreshold;               // waveChangeUp > 0.003
+  const macdOk  = isMACDCrossover(macdLine, signalLine);      // ta.crossover
+  const closeOk = currentClose > lastWaveLow;                 // close > lastWaveLow
+
+  const signal = waveOk && macdOk && closeOk;
 
   console.log(`
   📊 === BUY SIGNAL ANALYSIS ===
-  🌊 Wave Up: ${(waveChangeUp * 100).toFixed(3)}% (${waveUpCondition ? '✅' : '❌'} > ${(waveThreshold * 100).toFixed(1)}%)
-  📈 MACD Crossover: ${macdCrossover ? '✅' : '❌'}
-  💹 Price > Wave Low: ${currentPrice.toFixed(4)} > ${waveLow.toFixed(4)} (${priceConfirm ? '✅' : '❌'})
-  📍 Wave High: ${waveHigh.toFixed(4)}, Wave Low: ${waveLow.toFixed(4)}
+  🌊 Wave Up: ${(waveChangeUp * 100).toFixed(3)}% [high=${currentHigh.toFixed(4)}, lastWaveLow=${lastWaveLow.toFixed(4)}] (${waveOk ? '✅' : '❌'} > ${(waveThreshold * 100).toFixed(1)}%)
+  📈 MACD Crossover: ${macdOk ? '✅' : '❌'}
+  💹 Close > lastWaveLow: ${currentClose.toFixed(4)} > ${lastWaveLow.toFixed(4)} (${closeOk ? '✅' : '❌'})
+  📍 waveHigh: ${waveHigh.toFixed(4)}, waveLow: ${waveLow.toFixed(4)}
   🎯 RESULT: ${signal ? '✅ BUY SIGNAL' : '❌ NO SIGNAL'}
   `);
 
-  return {
-    signal,
-    details: {
-      waveChangeUp,
-      waveUpCondition,
-      macdCrossover,
-      priceConfirm,
-      currentPrice,
-      waveLow,
-      waveHigh,
-      currentATR,
-      waveLength
-    }
-  };
+  return { signal, details: { waveChangeUp, waveOk, macdOk, closeOk, currentClose, lastWaveLow, lastWaveHigh } };
 }
 
 /**
- * Перевірка SELL сигналу за стратегією TradingView
- * Умови:
- * 1. Хвиля йде ВНИЗ > 0.3%
- * 2. MACD перетинає Signal Line (crossunder)
- * 3. Ціна < локального максимуму хвилі
+ * Перевірка SHORT сигналу.
+ * Pine:
+ *   shortWaveCondition = waveChangeDown > 0.003
+ *   shortMacdCondition = ta.crossunder(macdLine, signalLine)
+ *   shortConfirm       = shortWaveCondition and shortMacdCondition and close < lastWaveHigh
  */
-function checkSellSignal(candles, config = {}) {
-  const {
-    minWaveLength = 8,
-    maxWaveLength = 21,
-    waveThreshold = 0.003, // 0.3%
-    atrLength = 14,
-    macdFast = 12,
-    macdSlow = 26,
-    macdSignal = 9
-  } = config;
+function checkSellSignal(indicators) {
+  if (!indicators?.isValid) return { signal: false, details: {} };
 
-  const closes = candles.map(c => c[4]);
-  const highs = candles.map(c => c[2]);
-  const lows = candles.map(c => c[3]);
-  const currentPrice = closes[closes.length - 1];
+  const { currentClose, currentLow, waves, macd } = indicators;
+  const { waveChangeDown, waveThreshold, lastWaveHigh, lastWaveLow, waveHigh, waveLow } = waves;
+  const { macdLine, signalLine } = macd;
 
-  // Розраховуємо ATR
-  const atr = calculateATR(highs, lows, closes, atrLength);
-  const currentATR = getLastATR(atr);
+  const waveOk  = waveChangeDown > waveThreshold;             // waveChangeDown > 0.003
+  const macdOk  = isMACDCrossunder(macdLine, signalLine);     // ta.crossunder
+  const closeOk = currentClose < lastWaveHigh;                // close < lastWaveHigh
 
-  if (!currentATR) {
-    console.log('❌ SELL: Недостатньо даних для ATR');
-    return { signal: false, details: {} };
-  }
-
-  // Розраховуємо динамічну довжину хвилі
-  const waveLength = calculateDynamicWaveLength(currentATR, minWaveLength, maxWaveLength);
-
-  // Розраховуємо хвильові патерни
-  const { waveHigh, waveLow } = calculateWavePatterns(highs, lows, waveLength);
-
-  if (waveHigh === null || waveLow === null) {
-    console.log('❌ SELL: Недостатньо даних для хвиль');
-    return { signal: false, details: {} };
-  }
-
-  // Розраховуємо зміну хвилі
-  const { waveChangeDown } = calculateWaveChange(currentPrice, waveLow, waveHigh);
-
-  // Перевіряємо умову 1: Хвиля вниз > 0.3%
-  const waveDownCondition = waveChangeDown > waveThreshold;
-
-  // Розраховуємо MACD
-  const { macdLine, signalLine, isValid: macdValid } = calculateMACD(
-    closes,
-    macdFast,
-    macdSlow,
-    macdSignal
-  );
-
-  if (!macdValid) {
-    console.log('❌ SELL: Недостатньо даних для MACD');
-    return { signal: false, details: {} };
-  }
-
-  // Перевіряємо умову 2: MACD crossunder
-  const macdCrossunder = isMACDCrossunder(macdLine, signalLine);
-
-  // Перевіряємо умову 3: Ціна < локального максимуму
-  const priceConfirm = currentPrice < waveHigh;
-
-  const signal = waveDownCondition && macdCrossunder && priceConfirm;
+  const signal = waveOk && macdOk && closeOk;
 
   console.log(`
   📊 === SELL SIGNAL ANALYSIS ===
-  🌊 Wave Down: ${(waveChangeDown * 100).toFixed(3)}% (${waveDownCondition ? '✅' : '❌'} > ${(waveThreshold * 100).toFixed(1)}%)
-  📉 MACD Crossunder: ${macdCrossunder ? '✅' : '❌'}
-  💹 Price < Wave High: ${currentPrice.toFixed(4)} < ${waveHigh.toFixed(4)} (${priceConfirm ? '✅' : '❌'})
-  📍 Wave High: ${waveHigh.toFixed(4)}, Wave Low: ${waveLow.toFixed(4)}
+  🌊 Wave Down: ${(waveChangeDown * 100).toFixed(3)}% [low=${currentLow.toFixed(4)}, lastWaveHigh=${lastWaveHigh.toFixed(4)}] (${waveOk ? '✅' : '❌'} > ${(waveThreshold * 100).toFixed(1)}%)
+  📉 MACD Crossunder: ${macdOk ? '✅' : '❌'}
+  💹 Close < lastWaveHigh: ${currentClose.toFixed(4)} < ${lastWaveHigh.toFixed(4)} (${closeOk ? '✅' : '❌'})
+  📍 waveHigh: ${waveHigh.toFixed(4)}, waveLow: ${waveLow.toFixed(4)}
   🎯 RESULT: ${signal ? '✅ SELL SIGNAL' : '❌ NO SIGNAL'}
   `);
 
-  return {
-    signal,
-    details: {
-      waveChangeDown,
-      waveDownCondition,
-      macdCrossunder,
-      priceConfirm,
-      currentPrice,
-      waveHigh,
-      waveLow,
-      currentATR,
-      waveLength
-    }
-  };
+  return { signal, details: { waveChangeDown, waveOk, macdOk, closeOk, currentClose, lastWaveHigh, lastWaveLow } };
 }
 
 module.exports = {
+  calculateAllIndicators,
+  calculateStopsAndTP,
   checkBuySignal,
   checkSellSignal
 };
