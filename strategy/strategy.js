@@ -4,7 +4,7 @@ const {
   calculateWavePatterns, 
   calculateDynamicWaveLength, 
   calculateWaveChange 
-} = require('../indicators/ waves');
+} = require('../indicators/waves');
 
 /**
  * Перевірка BUY сигналу за стратегією TradingView
