@@ -3,11 +3,12 @@
  * Точна реалізація Pine Script стратегії:
  * "Інноваційна хвильова стратегія з адаптивністю + Trailing Stop"
  *
- * Ключові відмінності від попередньої версії:
+ * Відповідність Pine Script (@version=5):
  * - lastWaveLow/lastWaveHigh — накопичувальні (як `var float` в Pine)
  * - waveChangeUp  = (high - lastWaveLow)  / lastWaveLow   (від HIGH свічки)
  * - waveChangeDown = (lastWaveHigh - low) / lastWaveHigh  (від LOW свічки)
- * - SL/TP/Trail рахуються від CLOSE на момент сигналу, множники ATR як в Pine
+ * - SL/TP/Trail рахуються від CLOSE на момент сигналу
+ * - Трейлінг активується після руху на trail_points, потім трейлить з trail_offset
  */
 
 const { calculateMACD, isMACDCrossover, isMACDCrossunder } = require('../indicators/macd');
@@ -21,7 +22,7 @@ const DEFAULTS = {
   atrLength:           14,
   atrMultiplierSL:     1.0,   // stop    = close ± atr * 1.0
   atrMultiplierTP:     5.0,   // limit   = close ± atr * 5.0
-  atrMultiplierTrail:  1.0,   // trail   = atr * 1.0
+  atrMultiplierTrail:  1.0,   // trail_points = trail_offset = atr * 1.0
   waveThreshold:       0.003, // 0.3%
   macdFast:            12,
   macdSlow:            26,
@@ -33,12 +34,10 @@ const DEFAULTS = {
  * точно як `var float` змінні в Pine Script.
  *
  * Pine:
+ *   var float lastWaveLow = na
+ *   var float lastWaveHigh = na
  *   if (na(lastWaveLow) or low < lastWaveLow)  lastWaveLow  := low
  *   if (na(lastWaveHigh) or high > lastWaveHigh) lastWaveHigh := high
- *
- * @param {number[]} highs
- * @param {number[]} lows
- * @returns {{ lastWaveHigh: number, lastWaveLow: number }}
  */
 function calcRunningWaveExtremes(highs, lows) {
   let lastWaveLow  = null;
@@ -54,11 +53,6 @@ function calcRunningWaveExtremes(highs, lows) {
 
 /**
  * Головна функція розрахунку індикаторів.
- *
- * @param {Array}       candles   - OHLCV свічки [[ts, o, h, l, c, v], ...]
- * @param {object}      cfg       - перевизначення параметрів (опціонально)
- * @param {number|null} livePrice - поточна ціна з fetchTicker (для currentClose)
- * @returns {object}
  */
 function calculateAllIndicators(candles, cfg = {}, livePrice = null) {
   const p = { ...DEFAULTS, ...cfg };
@@ -72,30 +66,28 @@ function calculateAllIndicators(candles, cfg = {}, livePrice = null) {
     ? Number(livePrice)
     : closes[closes.length - 1];
 
-  // Поточні high/low останньої (незакритої або останньої закритої) свічки
+  // Поточні high/low останньої свічки
   const currentHigh = highs[highs.length - 1];
   const currentLow  = lows[lows.length - 1];
 
-  // ── ATR ──────────────────────────────────────────────────────────────────
+  // ── ATR (має використовувати RMA / Wilder's smoothing як Pine ta.atr) ──────
   const atrArray   = calculateATR(highs, lows, closes, p.atrLength);
   const currentATR = getLastATR(atrArray);
 
   if (!currentATR) return { isValid: false, reason: 'ATR: недостатньо даних' };
 
   // ── Динамічна довжина хвилі ───────────────────────────────────────────────
-  // Pine: waveLengthDynamicRaw = atr * 10
-  //       waveLengthDynamic = round(clamp(raw, min, max))
+  // Pine: waveLengthDynamic = round(clamp(atr * 10, min, max))
   const waveLength = calculateDynamicWaveLength(currentATR, p.minWaveLength, p.maxWaveLength);
 
   // ── Локальні хвилі (ta.highest / ta.lowest) ───────────────────────────────
   // Pine: waveHigh = ta.highest(high, waveLengthDynamic)
-  //       waveLow  = ta.lowest(low,  waveLengthDynamic)
   const sliceHighs = highs.slice(-waveLength);
   const sliceLows  = lows.slice(-waveLength);
   const waveHigh   = Math.max(...sliceHighs);
   const waveLow    = Math.min(...sliceLows);
 
-  // ── Накопичувальні екстремуми (var float у Pine) ──────────────────────────
+  // ── Накопичувальні екстремуми ─────────────────────────────────────────────
   const { lastWaveHigh, lastWaveLow } = calcRunningWaveExtremes(highs, lows);
 
   if (lastWaveLow === null || lastWaveHigh === null) {
@@ -108,7 +100,7 @@ function calculateAllIndicators(candles, cfg = {}, livePrice = null) {
   const waveChangeUp   = lastWaveLow  !== 0 ? (currentHigh - lastWaveLow)  / lastWaveLow  : 0;
   const waveChangeDown = lastWaveHigh !== 0 ? (lastWaveHigh - currentLow) / lastWaveHigh  : 0;
 
-  // ── MACD ─────────────────────────────────────────────────────────────────
+  // ── MACD (має використовувати EMA як Pine ta.macd) ────────────────────────
   const { macdLine, signalLine, isValid: macdValid } = calculateMACD(
     closes, p.macdFast, p.macdSlow, p.macdSignal
   );
@@ -117,13 +109,10 @@ function calculateAllIndicators(candles, cfg = {}, livePrice = null) {
 
   return {
     isValid: true,
-    // Ціни
     currentClose,
     currentHigh,
     currentLow,
-    // ATR
     atr: currentATR,
-    // Хвилі
     waveLength,
     waves: {
       waveHigh,
@@ -134,9 +123,7 @@ function calculateAllIndicators(candles, cfg = {}, livePrice = null) {
       waveChangeDown,
       waveThreshold: p.waveThreshold
     },
-    // MACD
     macd: { macdLine, signalLine },
-    // Множники для стопів
     multipliers: {
       sl:    p.atrMultiplierSL,
       tp:    p.atrMultiplierTP,
@@ -146,20 +133,16 @@ function calculateAllIndicators(candles, cfg = {}, livePrice = null) {
 }
 
 /**
- * Розрахунок SL / TP / Trail — точно як в Pine strategy.exit:
+ * Розрахунок SL / TP / Trail — точно як в Pine strategy.exit.
  *
- * Long:  stop  = close - atr * atrMultiplierSL
- *        limit = close + atr * atrMultiplierTP
- *        trail = atr * atrMultiplierTrail
+ * Pine:
+ *   Long:  stop  = close - atr * atrMultiplierSL
+ *          limit = close + atr * atrMultiplierTP
+ *          trail_points = trail_offset = atr * atrMultiplierTrail
  *
- * Short: stop  = close + atr * atrMultiplierSL
- *        limit = close - atr * atrMultiplierTP
- *        trail = atr * atrMultiplierTrail
- *
- * @param {number} closePrice  - ціна закриття в момент сигналу
- * @param {number} atr         - поточний ATR
- * @param {string} side        - 'long' | 'short'
- * @param {object} multipliers - {sl, tp, trail}
+ *   Short: stop  = close + atr * atrMultiplierSL
+ *          limit = close - atr * atrMultiplierTP
+ *          trail_points = trail_offset = atr * atrMultiplierTrail
  */
 function calculateStopsAndTP(closePrice, atr, side, multipliers = {}) {
   const sl    = multipliers.sl    ?? DEFAULTS.atrMultiplierSL;
@@ -168,7 +151,7 @@ function calculateStopsAndTP(closePrice, atr, side, multipliers = {}) {
 
   const slDist    = atr * sl;
   const tpDist    = atr * tp;
-  const trailDist = atr * trail;
+  const trailDist = atr * trail;  // Одночасно і trail_points (активація), і trail_offset (відступ)
 
   const stopLoss   = side === 'long' ? closePrice - slDist : closePrice + slDist;
   const takeProfit = side === 'long' ? closePrice + tpDist : closePrice - tpDist;
@@ -176,7 +159,7 @@ function calculateStopsAndTP(closePrice, atr, side, multipliers = {}) {
   return {
     stopLoss:             Number(stopLoss.toFixed(4)),
     takeProfit:           Number(takeProfit.toFixed(4)),
-    trailingStopDistance: Number(trailDist.toFixed(4))
+    trailingStopDistance: Number(trailDist.toFixed(4))  // використовується як активаційний поріг і відступ
   };
 }
 
@@ -185,7 +168,7 @@ function calculateStopsAndTP(closePrice, atr, side, multipliers = {}) {
  * Pine:
  *   longWaveCondition = waveChangeUp > 0.003
  *   longMacdCondition = ta.crossover(macdLine, signalLine)
- *   longConfirm       = longWaveCondition and longMacdCondition and close > lastWaveLow
+ *   longConfirm = longWaveCondition and longMacdCondition and close > lastWaveLow
  */
 function checkBuySignal(indicators) {
   if (!indicators?.isValid) return { signal: false, details: {} };
@@ -194,7 +177,7 @@ function checkBuySignal(indicators) {
   const { waveChangeUp, waveThreshold, lastWaveLow, lastWaveHigh, waveHigh, waveLow } = waves;
   const { macdLine, signalLine } = macd;
 
-  const waveOk  = waveChangeUp > waveThreshold;               // waveChangeUp > 0.003
+  const waveOk  = waveChangeUp > waveThreshold;               // > 0.3%
   const macdOk  = isMACDCrossover(macdLine, signalLine);      // ta.crossover
   const closeOk = currentClose > lastWaveLow;                 // close > lastWaveLow
 
@@ -217,7 +200,7 @@ function checkBuySignal(indicators) {
  * Pine:
  *   shortWaveCondition = waveChangeDown > 0.003
  *   shortMacdCondition = ta.crossunder(macdLine, signalLine)
- *   shortConfirm       = shortWaveCondition and shortMacdCondition and close < lastWaveHigh
+ *   shortConfirm = shortWaveCondition and shortMacdCondition and close < lastWaveHigh
  */
 function checkSellSignal(indicators) {
   if (!indicators?.isValid) return { signal: false, details: {} };
@@ -226,7 +209,7 @@ function checkSellSignal(indicators) {
   const { waveChangeDown, waveThreshold, lastWaveHigh, lastWaveLow, waveHigh, waveLow } = waves;
   const { macdLine, signalLine } = macd;
 
-  const waveOk  = waveChangeDown > waveThreshold;             // waveChangeDown > 0.003
+  const waveOk  = waveChangeDown > waveThreshold;             // > 0.3%
   const macdOk  = isMACDCrossunder(macdLine, signalLine);     // ta.crossunder
   const closeOk = currentClose < lastWaveHigh;                // close < lastWaveHigh
 

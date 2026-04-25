@@ -2,6 +2,9 @@ const config = require('../config/config');
 const telegram = require('../utils/telegramNotifier');
 const WebSocket = require('ws');
 const binanceClientPromise = require('../utils/binanceClient');
+const https = require('https');
+const crypto = require('crypto');
+const querystring = require('querystring');
 
 let binance;
 let ws;
@@ -108,7 +111,9 @@ function setupWebSocketHandlers() {
     try {
       const event = JSON.parse(data);
       if (event.o && (event.o.x === 'FILLED' || event.o.x === 'LIQUIDATED')) {
-        await syncPositionWithExchange();
+        setTimeout(async () => {
+          await syncPositionWithExchange();
+        }, 3000);
       }
     } catch {}
   });
@@ -120,9 +125,6 @@ function setupWebSocketHandlers() {
 
 // ─── Orders ─────────────────────────────────────────────────────────────────
 
-/**
- * Скасовує всі відкриті ордери по символу.
- */
 async function cancelPositionOrders() {
   if (!binance || !config.symbol) return;
   try {
@@ -148,66 +150,126 @@ async function cancelPositionOrders() {
 }
 
 /**
- * Розміщує STOP_MARKET і TAKE_PROFIT_MARKET через прямий виклик
- * fapiPrivatePostOrder — єдиний надійний спосіб в ccxt для Binance Futures.
- *
- * Документація Binance:
- *   POST /fapi/v1/order
- *   type: STOP_MARKET        → обов'язкові: stopPrice, reduceOnly
- *   type: TAKE_PROFIT_MARKET → обов'язкові: stopPrice, reduceOnly
+ * Прямий підписаний POST-запит на /fapi/v1/order для стоп-маркет/тейк-профіт.
+ * Замінює binance.fapiPrivatePostOrder, щоб уникнути помилок CCXT.
+ */
+async function privatePostOrder(orderParams) {
+  const apiKey = binance.apiKey;
+  const secret = binance.secret;
+
+  const bodyParams = {
+    symbol: orderParams.symbol,
+    side: orderParams.side,
+    type: orderParams.type,
+    quantity: String(orderParams.quantity),
+    stopPrice: String(orderParams.stopPrice),
+    reduceOnly: 'true',
+    workingType: 'MARK_PRICE',
+    timestamp: Date.now(),
+    recvWindow: 5000
+  };
+
+  const queryString = querystring.stringify(bodyParams);
+  const signature = crypto.createHmac('sha256', secret).update(queryString).digest('hex');
+  const finalQuery = queryString + '&signature=' + signature;
+
+  const options = {
+    hostname: 'fapi.binance.com',
+    path: '/fapi/v1/order?' + finalQuery,
+    method: 'POST',
+    headers: {
+      'X-MBX-APIKEY': apiKey,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    }
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (res.statusCode === 200) {
+            resolve(json);
+          } else {
+            reject(new Error(`Order error: ${json.msg || data}`));
+          }
+        } catch (e) {
+          reject(new Error(`Parse error: ${data}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/**
+ * Створення/оновлення Stop-Loss та Take-Profit ордерів.
  */
 async function updateSafetyOrders() {
   if (!validateActivePosition()) return;
 
-  try {
-    await cancelPositionOrders();
+  const MAX_RETRIES = 2;
+  let attempt = 0;
 
-    const isBuy     = activePosition.type === 'buy';
-    const closeSide = isBuy ? 'SELL' : 'BUY';
-    const symbol    = config.symbol.replace('/', ''); // "SOLUSDT"
-    const qty       = String(activePosition.totalAmount);
+  const placeOrders = async () => {
+    try {
+      await cancelPositionOrders();
 
-    console.log('🛡️ Створюємо ордери безпеки:');
-    console.log(`   SL: ${activePosition.stopLoss.toFixed(4)}`);
-    console.log(`   TP: ${activePosition.takeProfit.toFixed(4)}`);
+      const isBuy     = activePosition.type === 'buy';
+      const closeSide = isBuy ? 'SELL' : 'BUY';
+      const symbol    = config.symbol.replace('/', '');   // SOLUSDT
+      const qty       = activePosition.totalAmount;
 
-    // ── TAKE_PROFIT_MARKET ────────────────────────────────────────────────
-    await safeExchangeCall(() =>
-      binance.fapiPrivatePostOrder({
+      console.log('🛡️ Створюємо ордери безпеки:');
+      console.log(`   SL: ${activePosition.stopLoss.toFixed(4)}`);
+      console.log(`   TP: ${activePosition.takeProfit.toFixed(4)}`);
+
+      // TAKE_PROFIT_MARKET
+      await privatePostOrder({
         symbol,
-        side:          closeSide,
-        type:          'TAKE_PROFIT_MARKET',
-        stopPrice:     activePosition.takeProfit.toFixed(4),
-        quantity:      qty,
-        reduceOnly:    'true',
-        workingType:   'MARK_PRICE',
-        timeInForce:   'GTC'
-      })
-    );
-    console.log(`✅ TP ордер створено: ${activePosition.takeProfit.toFixed(4)}`);
+        side: closeSide,
+        type: 'TAKE_PROFIT_MARKET',
+        quantity: qty,
+        stopPrice: activePosition.takeProfit.toFixed(4)
+      });
+      console.log(`✅ TP ордер створено: ${activePosition.takeProfit.toFixed(4)}`);
 
-    // ── STOP_MARKET ───────────────────────────────────────────────────────
-    await safeExchangeCall(() =>
-      binance.fapiPrivatePostOrder({
+      // STOP_MARKET
+      await privatePostOrder({
         symbol,
-        side:          closeSide,
-        type:          'STOP_MARKET',
-        stopPrice:     activePosition.stopLoss.toFixed(4),
-        quantity:      qty,
-        reduceOnly:    'true',
-        workingType:   'MARK_PRICE',
-        timeInForce:   'GTC'
-      })
-    );
-    console.log(`✅ SL ордер створено: ${activePosition.stopLoss.toFixed(4)}`);
+        side: closeSide,
+        type: 'STOP_MARKET',
+        quantity: qty,
+        stopPrice: activePosition.stopLoss.toFixed(4)
+      });
+      console.log(`✅ SL ордер створено: ${activePosition.stopLoss.toFixed(4)}`);
 
-    telegram.sendMessage(
-      `📍 TP/SL оновлено:\nSL: ${activePosition.stopLoss.toFixed(4)}\nTP: ${activePosition.takeProfit.toFixed(4)}`
-    );
+      telegram.sendMessage(
+        `📍 TP/SL оновлено:\nSL: ${activePosition.stopLoss.toFixed(4)}\nTP: ${activePosition.takeProfit.toFixed(4)}`
+      );
 
-  } catch (error) {
-    // Не кидаємо далі — позиція відкрита, SL/TP можна виправити вручну
-    console.error('🔴 Помилка створення ордерів TP/SL:', error.message);
+      return true;
+    } catch (error) {
+      console.error(`🔴 Помилка створення ордерів TP/SL (спроба ${attempt + 1}):`, error.message);
+      return false;
+    }
+  };
+
+  let success = await placeOrders();
+  attempt++;
+
+  while (!success && attempt <= MAX_RETRIES) {
+    console.log('🔄 Повторна спроба через 5 секунд...');
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    success = await placeOrders();
+    attempt++;
+  }
+
+  if (!success) {
+    console.error('⛔ Не вдалося створити TP/SL після повторів. Перевірте API-ключі та права.');
   }
 }
 
@@ -221,12 +283,28 @@ async function updateTrailingStop() {
     const currentPrice = ticker.last;
     if (!currentPrice) return;
 
-    const isBuy = activePosition.type === 'buy';
+    const isBuy   = activePosition.type === 'buy';
+    const entry   = activePosition.entryPrice;
+    const trailDist = activePosition.trailingStopDistance;
+
+    if (!activePosition.trailingActivated) {
+      const profitPercent = isBuy
+        ? (currentPrice - entry) / entry
+        : (entry - currentPrice) / entry;
+      const activationPercent = trailDist / entry;
+
+      if (profitPercent >= activationPercent) {
+        activePosition.trailingActivated = true;
+        console.log(`🔓 Трейлінг-стоп активовано (прибуток: ${(profitPercent * 100).toFixed(3)}%)`);
+      } else {
+        return;
+      }
+    }
 
     if (isBuy) {
       if (currentPrice > activePosition.highestPrice) {
         activePosition.highestPrice = currentPrice;
-        const newSL = activePosition.highestPrice - activePosition.trailingStopDistance;
+        const newSL = activePosition.highestPrice - trailDist;
         if (newSL > activePosition.stopLoss) {
           activePosition.stopLoss = newSL;
           console.log(`🔄 Трейлінг SL оновлено: ${newSL.toFixed(4)}`);
@@ -236,7 +314,7 @@ async function updateTrailingStop() {
     } else {
       if (currentPrice < activePosition.lowestPrice || activePosition.lowestPrice === 0) {
         activePosition.lowestPrice = currentPrice;
-        const newSL = activePosition.lowestPrice + activePosition.trailingStopDistance;
+        const newSL = activePosition.lowestPrice + trailDist;
         if (newSL < activePosition.stopLoss || activePosition.stopLoss === 0) {
           activePosition.stopLoss = newSL;
           console.log(`🔄 Трейлінг SL оновлено: ${newSL.toFixed(4)}`);
@@ -291,8 +369,15 @@ async function syncPositionWithExchange() {
       activePosition.totalAmount = Math.abs(Number(position.contracts));
       activePosition.entryPrice  = Number(position.entryPrice || position.markPrice);
 
-      if (activePosition.type === 'buy') activePosition.highestPrice = activePosition.entryPrice;
-      else                               activePosition.lowestPrice  = activePosition.entryPrice;
+      activePosition.trailingActivated = false;
+
+      if (activePosition.type === 'buy') {
+        activePosition.highestPrice = activePosition.entryPrice;
+        activePosition.lowestPrice  = 0;
+      } else {
+        activePosition.lowestPrice  = activePosition.entryPrice;
+        activePosition.highestPrice = 0;
+      }
 
       if (activePosition.trailingInterval) clearInterval(activePosition.trailingInterval);
       activePosition.trailingInterval = setInterval(updateTrailingStop, 5000);
@@ -316,7 +401,6 @@ async function closePosition() {
       binance.createOrder(config.symbol, 'MARKET', oppositeSide, activePosition.totalAmount)
     );
 
-    // Чекаємо підтвердження закриття
     for (let i = 0; i < 10; i++) {
       const positions = await binance.fetchPositions([config.symbol]);
       const pos = positions.find(p => p.symbol.includes(config.symbol.replace('/', '')));
@@ -335,24 +419,15 @@ async function closePosition() {
   }
 }
 
-/**
- * Відкриття нової позиції.
- * @param {string} type   - 'buy' | 'sell'
- * @param {number} amount
- * @param {number} entryPrice
- * @param {object} stops  - {stopLoss, takeProfit, trailingStopDistance}
- */
 async function openNewPosition(type, amount = config.tradeAmount, entryPrice = null, stops = {}) {
   try {
     if (!await checkExchangeConnection()) throw new Error('Немає підключення');
 
-    // Перевірка локального стану
     if (validateActivePosition()) {
       console.log(`⛔ Позиція вже є в пам'яті (${activePosition.type}), нову не відкриваємо`);
       return;
     }
 
-    // Перевірка на біржі
     const positions       = await binance.fetchPositions([config.symbol]);
     const existingPos     = positions.find(p =>
       p.symbol.includes(config.symbol.replace('/', '')) &&
@@ -364,7 +439,6 @@ async function openNewPosition(type, amount = config.tradeAmount, entryPrice = n
       return;
     }
 
-    // Перевірка балансу
     const balance   = await binance.fetchBalance({ type: 'future' });
     const available = balance.total?.USDT || 0;
     if (available < 10) {
@@ -377,7 +451,6 @@ async function openNewPosition(type, amount = config.tradeAmount, entryPrice = n
       binance.createOrder(config.symbol, 'market', type, amount)
     );
 
-    // Отримуємо реальну ціну входу
     const realEntry = order?.average || order?.fills?.[0]?.price;
     if (!realEntry || isNaN(realEntry)) {
       const ticker = await safeExchangeCall(() => binance.fetchTicker(config.symbol));
@@ -386,17 +459,22 @@ async function openNewPosition(type, amount = config.tradeAmount, entryPrice = n
       entryPrice = Number(realEntry);
     }
 
-    // Зберігаємо позицію в пам'яті
-    activePosition.id                  = generatePositionId();
-    activePosition.type                = type;
-    activePosition.totalAmount         = amount;
-    activePosition.entryPrice          = entryPrice;
-    activePosition.stopLoss            = Number(stops.stopLoss)             || entryPrice * (type === 'buy' ? 0.97 : 1.03);
-    activePosition.takeProfit          = Number(stops.takeProfit)           || entryPrice * (type === 'buy' ? 1.03 : 0.97);
+    activePosition.id                   = generatePositionId();
+    activePosition.type                 = type;
+    activePosition.totalAmount          = amount;
+    activePosition.entryPrice           = entryPrice;
+    activePosition.stopLoss             = Number(stops.stopLoss)             || entryPrice * (type === 'buy' ? 0.97 : 1.03);
+    activePosition.takeProfit           = Number(stops.takeProfit)           || entryPrice * (type === 'buy' ? 1.03 : 0.97);
     activePosition.trailingStopDistance = Number(stops.trailingStopDistance) || entryPrice * 0.005;
+    activePosition.trailingActivated    = false;
 
-    if (type === 'buy') { activePosition.highestPrice = entryPrice; activePosition.lowestPrice = 0; }
-    else                { activePosition.lowestPrice  = entryPrice; activePosition.highestPrice = 0; }
+    if (type === 'buy') {
+      activePosition.highestPrice = entryPrice;
+      activePosition.lowestPrice  = 0;
+    } else {
+      activePosition.lowestPrice  = entryPrice;
+      activePosition.highestPrice = 0;
+    }
 
     console.log(`📊 Позиція відкрита:`);
     console.log(`   Тип: ${type}`);
@@ -406,10 +484,8 @@ async function openNewPosition(type, amount = config.tradeAmount, entryPrice = n
     console.log(`   Take Profit: ${activePosition.takeProfit.toFixed(4)}`);
     console.log(`   Трейлінг дистанція: ${activePosition.trailingStopDistance.toFixed(4)}`);
 
-    // Встановлюємо TP/SL
     await updateSafetyOrders();
 
-    // Запускаємо трейлінг
     if (activePosition.trailingInterval) clearInterval(activePosition.trailingInterval);
     activePosition.trailingInterval = setInterval(updateTrailingStop, 5000);
 
@@ -433,7 +509,8 @@ function getActivePosition() {
     size:       activePosition.totalAmount,
     entryPrice: activePosition.entryPrice,
     stopLoss:   activePosition.stopLoss,
-    takeProfit: activePosition.takeProfit
+    takeProfit: activePosition.takeProfit,
+    trailingActivated: activePosition.trailingActivated
   };
 }
 

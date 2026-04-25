@@ -63,14 +63,14 @@ async function runTradingCycle() {
   if (!isRunning) return;
 
   try {
-    // 1. Завантажуємо свічки для ATR / MACD / хвиль
+    // 1. Завантажуємо свічки
     const candles = await fetchOHLCV(config.symbol, config.timeframe);
     if (!candles || candles.length < 50) {
       logger.warn('⚠️ Недостатньо даних для аналізу');
       return;
     }
 
-    // 2. Жива ціна з ticker — щоб currentClose не відставав на 15 хв
+    // 2. Жива ціна з ticker
     let livePrice = null;
     try {
       const ticker = await binance.fetchTicker(config.symbol);
@@ -80,8 +80,8 @@ async function runTradingCycle() {
       logger.warn(`⚠️ fetchTicker не вдався, використовуємо ціну свічки: ${e.message}`);
     }
 
-    // 3. Розраховуємо всі індикатори (логіка Pine Script)
-    const indicators = calculateAllIndicators(candles, {}, livePrice);
+    // 3. Розраховуємо всі індикатори
+    const indicators = calculateAllIndicators(candles, config.strategy || {}, livePrice);
     if (!indicators.isValid) {
       logger.debug(`Індикатори не готові: ${indicators.reason}`);
       return;
@@ -94,18 +94,26 @@ async function runTradingCycle() {
     const buySignal  = buyData.signal;
     const sellSignal = sellData.signal;
 
-    // 5. Cooldown — не торгуємо частіше ніж раз на хвилину
+    // 5. Cooldown
     const now = Date.now();
     if (now - lastSignalTime < SIGNAL_COOLDOWN) {
       logger.debug('⏳ Cooldown активний');
       return;
     }
 
-    const balance        = await trading.getAccountBalance();
+    // 6. Отримуємо актуальний стан позиції
     const activePosition = trading.getActivePosition();
 
-    // 6. BUY сигнал
+    // ── BUY сигнал ──────────────────────────────────────────────────────────
     if (buySignal && !sellSignal) {
+
+      // 🔒 Якщо вже є LONG — ігноруємо (Pine: alertLong вимагає pos_size <= 0)
+      if (activePosition.isOpen && activePosition.side === 'long') {
+        logger.debug('ℹ️ Позиція LONG вже відкрита, сигнал ігнорується');
+        logger.cycleStatus(await trading.getAccountBalance(), activePosition);
+        return;
+      }
+
       logger.signalDetected(true, {
         currentPrice: indicators.currentClose,
         waveChangeUp: indicators.waves.waveChangeUp,
@@ -113,12 +121,12 @@ async function runTradingCycle() {
         waveHigh:     indicators.waves.lastWaveHigh
       });
 
+      // Закриваємо протилежну позицію (SHORT → закрити)
       if (activePosition.isOpen && activePosition.side === 'short') {
         logger.info('🔄 Закриваємо SHORT перед LONG');
         await trading.closePosition();
       }
 
-      // Стопи від close в момент сигналу (як в Pine strategy.exit)
       const stops = calculateStopsAndTP(
         indicators.currentClose,
         indicators.atr,
@@ -126,12 +134,23 @@ async function runTradingCycle() {
         indicators.multipliers
       );
 
-      logger.tradeOpen('buy', config.tradeAmount, config.symbol, indicators.currentClose, stops);
+      // Виконуємо вхід
       await handleTradeSignal('buy', indicators.currentClose, config.tradeAmount, stops);
+
+      // Логуємо відкриття ТІЛЬКИ після успішного виконання
+      logger.tradeOpen('buy', config.tradeAmount, config.symbol, indicators.currentClose, stops);
       lastSignalTime = now;
     }
-    // 7. SELL сигнал
+    // ── SELL сигнал ─────────────────────────────────────────────────────────
     else if (sellSignal && !buySignal) {
+
+      // 🔒 Якщо вже є SHORT — ігноруємо (Pine: alertShort вимагає pos_size >= 0)
+      if (activePosition.isOpen && activePosition.side === 'short') {
+        logger.debug('ℹ️ Позиція SHORT вже відкрита, сигнал ігнорується');
+        logger.cycleStatus(await trading.getAccountBalance(), activePosition);
+        return;
+      }
+
       logger.signalDetected(false, {
         currentPrice:   indicators.currentClose,
         waveChangeDown: indicators.waves.waveChangeDown,
@@ -139,6 +158,7 @@ async function runTradingCycle() {
         waveHigh:       indicators.waves.lastWaveHigh
       });
 
+      // Закриваємо протилежну позицію (LONG → закрити)
       if (activePosition.isOpen && activePosition.side === 'long') {
         logger.info('🔄 Закриваємо LONG перед SHORT');
         await trading.closePosition();
@@ -151,12 +171,16 @@ async function runTradingCycle() {
         indicators.multipliers
       );
 
-      logger.tradeOpen('sell', config.tradeAmount, config.symbol, indicators.currentClose, stops);
       await handleTradeSignal('sell', indicators.currentClose, config.tradeAmount, stops);
+
+      logger.tradeOpen('sell', config.tradeAmount, config.symbol, indicators.currentClose, stops);
       lastSignalTime = now;
     }
 
-    logger.cycleStatus(balance, activePosition);
+    // 7. Статус циклу — використовуємо СВІЖИЙ стан після всіх дій
+    const freshBalance    = await trading.getAccountBalance();
+    const freshPosition   = trading.getActivePosition();
+    logger.cycleStatus(freshBalance, freshPosition);
 
   } catch (error) {
     logger.error('Помилка циклу торгівлі', error);
