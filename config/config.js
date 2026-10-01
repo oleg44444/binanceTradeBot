@@ -1,16 +1,16 @@
 require('dotenv').config();
 
 module.exports = {
-    symbol: 'SOLUSDT',
+    symbol: 'ETHUSDT',
     timeframe: '15m',
     tradeAmount: 1,
     leverage: 20,
     updateInterval: 30000,  // 30 секунд - оновлення кожні 30 сек
     maxRequestsPerMinute: 50,
     binance: {
-        apiKey: process.env.BINANCE_API_KEY_REAL,
-        apiSecret: process.env.BINANCE_API_SECRET_REAL,
-        testnet: false
+        apiKey: process.env.BINANCE_API_KEY,
+        apiSecret: process.env.BINANCE_API_SECRET,
+        testnet: true
     },
     
     // === ПАРАМЕТРИ СТРАТЕГІЇ ===
