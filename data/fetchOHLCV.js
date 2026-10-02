@@ -1,20 +1,20 @@
 const binanceClientPromise = require('../utils/binanceClient');
 
-async function fetchOHLCV(symbol, timeframe, limit = 250) {
+/**
+ * Завантажує ОСТАННІ `limit` свічок.
+ * Раніше тут передавався `since = now - 7d` разом з `limit`, через що Binance віддавав
+ * ПЕРШІ 250 свічок від since (дані ~4 доби тому), а не поточні. Тепер since не передається.
+ *
+ * Повертає масив [[time, open, high, low, close, volume], ...]; остання свічка — ще формується.
+ */
+async function fetchOHLCV(symbol, timeframe, limit = 500) {
   const binance = await binanceClientPromise();
   try {
-    console.log(`\uD83D\uDCC8 Завантаження ${limit} свічок ${timeframe} для ${symbol}...`);
-
-    const since = Date.now() - (1000 * 60 * 60 * 24 * 7);
-    const candles = await binance.fetchOHLCV(symbol, timeframe, since, limit);
+    const candles = await binance.fetchOHLCV(symbol, timeframe, undefined, limit);
 
     if (!candles || candles.length === 0) {
       throw new Error('Не отримано даних свічок');
     }
-
-    console.log(`✅ Отримано ${candles.length} свічок`);
-
-    // Повертаємо масив масивів без змін (для зменшення конфлікту типів)
     return candles;
   } catch (error) {
     console.error(`🔴 Помилка завантаження свічок: ${error.message}`);

@@ -37,13 +37,26 @@ function createBinanceClient(apiKey, apiSecret) {
     secret: apiSecret,
     options: {
       defaultType: 'future',
-      testnet: config.binance.testnet || false,
       adjustForTimeDifference: true
     },
     enableRateLimit: true,
     timeout: 30000,
     rateLimit: 150
   });
+
+  // Demo Trading (demo.binance.com) -> demo-fapi.binance.com
+  // Потрібно викликати ДО loadMarkets()
+  if (config.binance.demo) {
+    if (typeof client.enableDemoTrading !== 'function') {
+      throw new Error(
+        '❌ Ваша версія ccxt не підтримує Demo Trading. Виконайте: npm install ccxt@latest'
+      );
+    }
+    client.enableDemoTrading(true);
+    console.log('🧪 Режим: Binance DEMO Trading (demo-fapi.binance.com)');
+  } else {
+    console.log('⚠️ Режим: РЕАЛЬНИЙ акаунт (fapi.binance.com)');
+  }
 
   // Додаємо додаткові методи з правильним контекстом
   client.setLeverage = async (leverage, symbol) => {

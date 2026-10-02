@@ -141,6 +141,26 @@ function cycleStatus(balance, activePosition) {
   console.log(`${'='.repeat(60)}\n`);
 }
 
+/**
+ * Звіт стратегії по новій закритій свічці: які умови виконані для LONG/SHORT.
+ */
+function strategyReport(strategyId, barTime, analysis) {
+  const t = new Date(barTime).toLocaleString('uk-UA');
+  console.log(`\n${'─'.repeat(60)}`);
+  console.log(`🕯️  Нова закрита свічка [${t}] | стратегія: ${strategyId}`);
+  console.log(`   Ціна: ${analysis.price.toFixed(2)} | ATR: ${analysis.atr.toFixed(4)}`);
+  for (const [label, checks] of [['LONG ', analysis.checks.long], ['SHORT', analysis.checks.short]]) {
+    const passed = checks.filter(c => c.ok).length;
+    console.log(`   ${label} (${passed}/${checks.length}):`);
+    for (const c of checks) {
+      console.log(`     ${c.ok ? '✅' : '❌'} ${c.name}${c.value ? ` — ${c.value}` : ''}`);
+    }
+  }
+  const sig = analysis.signal === 'buy' ? '🟢 BUY' : analysis.signal === 'sell' ? '🔴 SELL' : '— немає сигналу';
+  console.log(`   Результат: ${sig}`);
+  console.log(`${'─'.repeat(60)}\n`);
+}
+
 function setLogLevel(level) {
   if (LOG_LEVELS[level]) {
     currentLogLevel = level;
@@ -159,6 +179,7 @@ module.exports = {
   trailingStop,
   breakEvenActivated,
   signalDetected,
+  strategyReport,
   cycleStatus,
   LOG_LEVELS
 };
